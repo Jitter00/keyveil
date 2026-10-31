@@ -75,11 +75,16 @@ Built-in routes:
 
 Any other provider, including other OpenAI-compatible ones, is a custom route.
 
-Only the routes listed under "Verified" below have been exercised end to end against a real
-API by the author. The others, and all auth styles, are covered by offline tests that use a
-local fake upstream and share the same code path.
+### Compatibility
 
-**Verified:** DeepSeek.
+keyveil works with any API key that is sent in an HTTP request header. It never inspects the
+request or the key, so there is no per-provider logic: a provider works if its route has the
+right upstream, variable name and auth style.
+
+Test coverage: every auth style and the routing logic are covered by offline tests against a
+local fake upstream. The author has also run it against the real DeepSeek and Anthropic APIs
+(including streaming). Other providers use the same code path but haven't been tried by the
+author; if one doesn't work, please open an issue.
 
 ### Auth styles
 
