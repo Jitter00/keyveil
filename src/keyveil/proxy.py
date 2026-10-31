@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""llm-key-proxy — localhost reverse proxy that injects API credentials held only in RAM.
+"""keyveil — localhost reverse proxy that injects API credentials held only in RAM.
 
 Usage:  rage -d -i <identity> env.age | python3 -I proxy.py [--port 8787] [--routes routes.json]
 
@@ -11,7 +11,7 @@ with any dummy key; the proxy strips it and adds the real one before forwarding
 upstream. A route is only enabled if its key is present on stdin.
 
 This file is self-contained (standard library only) so it can be run directly
-with ``python3 -I`` as well as through the ``llm-key-proxy`` console script.
+with ``python3 -I`` as well as through the ``keyveil`` console script.
 """
 import argparse
 import ctypes
@@ -212,7 +212,7 @@ def main(argv=None):
         try:
             load_routes_file(args.routes)
         except (OSError, ValueError) as e:  # json.JSONDecodeError is a ValueError
-            sys.exit("llm-key-proxy: bad routes file %s: %s" % (args.routes, e))
+            sys.exit("keyveil: bad routes file %s: %s" % (args.routes, e))
 
     harden()
     env = parse_env(sys.stdin.read())
@@ -221,13 +221,13 @@ def main(argv=None):
     del env
     if not KEYS:
         wanted = sorted(e for _, e, _ in ROUTES.values())
-        sys.exit("llm-key-proxy: no usable keys on stdin. wanted=%s found_names=%s"
+        sys.exit("keyveil: no usable keys on stdin. wanted=%s found_names=%s"
                  % (wanted, names))  # names only, never values
 
     srv = ThreadingHTTPServer((args.host, port), Handler)
     srv.daemon_threads = True
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    sys.stderr.write("llm-key-proxy on %s:%d routes=%s\n"
+    sys.stderr.write("keyveil on %s:%d routes=%s\n"
                      % (args.host, port, ",".join(sorted(KEYS))))
     sys.stderr.flush()
     try:

@@ -1,6 +1,0 @@
-# Copy to llm-proxy.conf (gitignored) and adjust. Not secrets, just paths/settings.
-LLM_PROXY_IDENTITY="$HOME/.config/age/identity.txt"   # age identity (e.g. an age-plugin-yubikey stub)
-#LLM_PROXY_ENV_FILE="$HOME/.config/llm-key-proxy/env.age"   # default: ./.env.age
-#LLM_PROXY_PORT=8787
-#LLM_PROXY_AGE=rage
-#LLM_PROXY_ROUTES=routes.json   # extra routes file (default: ./routes.json if present)

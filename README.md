@@ -1,23 +1,24 @@
-# llm-key-proxy
+# keyveil
 
 A tiny localhost reverse proxy that adds your **API credentials to HTTP requests from
 memory**, so the tools making those requests — editors, coding agents, scripts, SDKs —
 never see, store, or inherit the real key.
 
 ```
- Continue / Cline / Claude Code ─┐                      ┌─▶ api.deepseek.com   (Bearer)
- your scripts, notebooks, SDKs  ─┼─(dummy key)─▶ 127.0.0.1:8787 ─┼─▶ api.anthropic.com  (x-api-key)
- curl, CI-like local tools      ─┘     llm-key-proxy     └─▶ netbox.example.com (Token)
-                                 real keys live only in this process's RAM
+ editor extensions   ─┐                          ┌─▶ api.anthropic.com   (x-api-key)
+ coding agents       ─┼─(dummy key)─▶ 127.0.0.1:8787 ─┼─▶ api.openai.com      (Bearer)
+ scripts, SDKs, curl ─┘          keyveil          └─▶ any other API       (Token / custom header)
+                      real keys live only in this process's RAM
 ```
 
 Keys stay encrypted at rest (`.env.age`, decrypted with [age]/[rage], ideally with a hardware
 key such as a YubiKey). They are decrypted once, piped straight into the proxy's stdin, and
 never touch the disk — not even `/run/user` or `/tmp`.
 
-It was built for keeping LLM keys away from AI coding tools, which is the main use case and
-the one the built-in routes cover. But the mechanism is not LLM-specific: it works for any
-HTTP API that authenticates with a key or token in a request header.
+It was built to keep LLM provider keys away from AI coding tools, but nothing in it is
+provider-specific: it works for any HTTP API that authenticates with a key or token in a
+request header. Built-in routes cover a few common providers; anything else is a few lines in
+a JSON file.
 
 ## What is it good for?
 
@@ -49,13 +50,13 @@ That is the obvious approach, and it has real downsides:
 - Tools that read secrets from files (Continue's `~/.continue/.env`, Cline's
   `~/.cline/data/secrets.json`) leave plaintext credentials on disk.
 
-With the proxy, only one hardened process holds the key. Code running in your editor or
-agent can *use* the proxy while it is up, but it can never *read* the key.
+With keyveil, only one hardened process holds the key. Code running in your editor or agent
+can *use* the proxy while it is up, but it can never *read* the key.
 
 ## How it works
 
 - Listens on `127.0.0.1` only. Routes are `/<name>/...` → an upstream API
-  (`/deepseek/v1/chat/completions` → `https://api.deepseek.com/v1/chat/completions`).
+  (`/openai/v1/chat/completions` → `https://api.openai.com/v1/chat/completions`).
 - Drops any credential header the client sent and sets the real one.
 - Streams responses chunk by chunk, so SSE / streaming responses work.
 - Verifies upstream TLS certificates.
@@ -66,19 +67,23 @@ agent can *use* the proxy while it is up, but it can never *read* the key.
 
 Built-in routes:
 
-| Route        | Upstream                    | Env var             | Auth                   |
-|--------------|-----------------------------|---------------------|------------------------|
-| `/deepseek/` | `https://api.deepseek.com`  | `DEEPSEEK_API_KEY`  | `bearer`               |
-| `/openai/`   | `https://api.openai.com`    | `OPENAI_API_KEY`    | `bearer`               |
-| `/anthropic/`| `https://api.anthropic.com` | `ANTHROPIC_API_KEY` | `x-api-key`            |
+| Route         | Upstream                    | Env var             | Auth        |
+|---------------|-----------------------------|---------------------|-------------|
+| `/anthropic/` | `https://api.anthropic.com` | `ANTHROPIC_API_KEY` | `x-api-key` |
+| `/openai/`    | `https://api.openai.com`    | `OPENAI_API_KEY`    | `bearer`    |
+| `/deepseek/`  | `https://api.deepseek.com`  | `DEEPSEEK_API_KEY`  | `bearer`    |
 
-Only the DeepSeek route has been exercised end to end against a real API by the author. The
-other routes and the auth styles below are covered by offline tests that use a local fake
-upstream, and use the same code path.
+Any other provider, including other OpenAI-compatible ones, is a custom route.
+
+Only the routes listed under "Verified" below have been exercised end to end against a real
+API by the author. The others, and all auth styles, are covered by offline tests that use a
+local fake upstream and share the same code path.
+
+**Verified:** DeepSeek.
 
 ### Auth styles
 
-| `auth` value      | Header the proxy sets             | Typical use                         |
+| `auth` value      | Header keyveil sets               | Typical use                         |
 |-------------------|-----------------------------------|-------------------------------------|
 | `bearer` (default)| `Authorization: Bearer <key>`     | OpenAI-compatible APIs, most SaaS   |
 | `token`           | `Authorization: Token <key>`      | NetBox, Django REST Framework APIs  |
@@ -89,7 +94,7 @@ upstream, and use the same code path.
 
 Add services without touching the code. Copy [`routes.example.json`](routes.example.json) to
 `routes.json` (gitignored; the launcher picks it up automatically, or pass `--routes FILE` /
-set `LLM_PROXY_ROUTES`). The file holds only env var **names**, never secrets:
+set `KEYVEIL_ROUTES`). The file holds only env var **names**, never secrets:
 
 ```json
 {
@@ -125,69 +130,91 @@ crosses a network in clear. A bad routes file makes the proxy refuse to start, w
    rage -r <your-age-recipient> -o .env.age .env && shred -u .env
    ```
 
-3. **Tell the launcher where your identity is.** Copy `llm-proxy.conf.example` to
-   `llm-proxy.conf` (gitignored) and set `LLM_PROXY_IDENTITY`. Other options
-   (`LLM_PROXY_ENV_FILE`, `LLM_PROXY_PORT`, `LLM_PROXY_AGE`, `LLM_PROXY_ROUTES`) are
-   documented in the file.
+   Keep the variable names the routes expect (e.g. `ANTHROPIC_API_KEY`).
+
+3. **Tell the launcher where your identity is.** Copy `keyveil.conf.example` to
+   `keyveil.conf` (gitignored) and set `KEYVEIL_IDENTITY`. Other options
+   (`KEYVEIL_ENV_FILE`, `KEYVEIL_PORT`, `KEYVEIL_AGE`, `KEYVEIL_ROUTES`) are documented in
+   the file.
 
 4. **Optional shell aliases** (adjust the path):
 
    ```bash
-   alias llmup='~/path/to/llm-key-proxy/llm-proxy.sh start'
-   alias llmdown='~/path/to/llm-key-proxy/llm-proxy.sh stop'
-   alias llmstatus='~/path/to/llm-key-proxy/llm-proxy.sh status'
+   alias veilup='~/path/to/keyveil/keyveil.sh start'
+   alias veildown='~/path/to/keyveil/keyveil.sh stop'
+   alias veilstatus='~/path/to/keyveil/keyveil.sh status'
    ```
 
 ## Usage
 
 ```bash
-./llm-proxy.sh start    # touch your YubiKey; prints "ok" when listening
-./llm-proxy.sh status
-./llm-proxy.sh stop     # also stops when you log out / reboot
+./keyveil.sh start    # touch your YubiKey; prints "ok" when listening
+./keyveil.sh status
+./keyveil.sh stop     # also stops when you log out / reboot
 ```
 
-Check it (the `Bearer` value is ignored and replaced):
+Check it (the credential you send is ignored and replaced):
 
 ```bash
-curl -s http://127.0.0.1:8787/deepseek/v1/models -H 'Authorization: Bearer anything'
+curl -s http://127.0.0.1:8787/<route>/<path> -H 'Authorization: Bearer anything'
+# e.g. list models on an OpenAI-compatible route:
+curl -s http://127.0.0.1:8787/openai/v1/models -H 'Authorization: Bearer anything'
 ```
 
 Without the launcher, the same thing by hand:
 
 ```bash
-rage -d -i identity.txt .env.age | python3 -I src/llm_key_proxy/proxy.py --port 8787
+rage -d -i identity.txt .env.age | python3 -I src/keyveil/proxy.py --port 8787
 ```
 
 ### Point your tools at it
 
-Use any non-empty dummy key (e.g. `local-proxy`) — it is not a credential.
+Use any non-empty dummy key (e.g. `local-proxy`) — it is not a credential. The pattern is always
+the same: base URL `http://127.0.0.1:8787/<route>/…`, dummy key.
 
-**Continue** (`~/.continue/config.yaml`):
+**Claude Code** (needs `ANTHROPIC_API_KEY` in `.env.age`; keep that name there — the dummy
+below is only a client-side placeholder). In `~/.claude/settings.json`:
+
+```json
+{ "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/anthropic",
+           "ANTHROPIC_AUTH_TOKEN": "local-proxy" } }
+```
+
+Notes:
+- Don't also export the real key in your shell, or Claude's environment would hold it again.
+- With this in the user-level file, `claude` fails with a connection error whenever keyveil
+  isn't running. To limit it to one project use `.claude/settings.local.json`, or to one
+  session use `claude --settings '{"env": {...}}'`.
+- Values in a settings file's `env` block override variables set in your shell. If you have
+  an alias that sets its own `ANTHROPIC_BASE_URL` (say, for another gateway), pass it with
+  `--settings` too — that flag outranks the user-level file.
+
+**OpenAI-compatible tools** (Continue, Cline, Aider, SDKs…): set the base URL to
+`http://127.0.0.1:8787/<route>/v1` and the API key to the dummy. For example, Continue
+(`~/.continue/config.yaml`):
 
 ```yaml
 models:
-  - name: DeepSeek
-    provider: deepseek            # or `openai` if your version ignores apiBase
-    model: deepseek-flash
-    apiBase: http://127.0.0.1:8787/deepseek/v1/
+  - name: My model
+    provider: openai
+    model: <model-id>
+    apiBase: http://127.0.0.1:8787/openai/v1/    # or /<your-route>/v1/
     apiKey: local-proxy
 ```
 
-**Cline**: Settings → API Provider **OpenAI Compatible** → Base URL
-`http://127.0.0.1:8787/deepseek/v1`, API key `local-proxy`, Model ID of your choice.
-(Cline's built-in DeepSeek provider has no base-URL field, so it can't use the proxy.)
+Cline: Settings → API Provider **OpenAI Compatible** → Base URL
+`http://127.0.0.1:8787/<route>/v1`, API key `local-proxy`, Model ID of your choice. (Providers
+with a dedicated, base-URL-less entry in a tool's menu generally can't be redirected; use the
+tool's OpenAI-compatible option.)
 
-**Claude Code / Anthropic SDK** (needs `ANTHROPIC_API_KEY` in `.env.age`):
-
-```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:8787/anthropic ANTHROPIC_AUTH_TOKEN=local-proxy claude
-```
-
-**OpenAI-compatible SDKs / scripts**: set the base URL to `http://127.0.0.1:8787/<route>/v1`:
+**SDKs / scripts**:
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8787/deepseek/v1", api_key="local-proxy")
+client = OpenAI(base_url="http://127.0.0.1:8787/openai/v1", api_key="local-proxy")
+
+from anthropic import Anthropic
+client = Anthropic(base_url="http://127.0.0.1:8787/anthropic", api_key="local-proxy")
 ```
 
 **Any other HTTP client** (custom route, e.g. NetBox):
@@ -200,8 +227,8 @@ curl -s http://127.0.0.1:8787/netbox/api/dcim/sites/ -H 'Authorization: Token un
 
 - **No client authentication.** Any process running as you (or any local user, if you
   change `--host`) can make requests through the proxy while it is up — it just can't
-  read the key. Stop it with `llmdown` when you're not using it. Keep the default bind
-  address of `127.0.0.1`.
+  read the key. Stop it when you're not using it. Keep the default bind address of
+  `127.0.0.1`.
 - Protects against leaking the key via files, environment variables, process listings and
   agents. It does **not** protect against root, a compromised kernel, or someone who can
   already use your unlocked YubiKey.
@@ -212,26 +239,26 @@ curl -s http://127.0.0.1:8787/netbox/api/dcim/sites/ -H 'Authorization: Token un
 - `mlockall` needs a sufficient `ulimit -l`; if it fails it is silently skipped.
 - Prompts and responses pass through the proxy's memory but are never logged.
 - If decryption yields none of the expected variables, the proxy exits and logs the variable
-  **names** it found (never values) to `~/.cache/llm-key-proxy.log`.
+  **names** it found (never values) to `~/.cache/keyveil.log`.
 
 ## Development
 
 ```bash
 uv sync                                          # create the venv
 uv run python -m unittest discover -s tests -v   # offline tests (fake upstream, no real keys)
-uv run llm-key-proxy --help
-uv tool install .                                # optional: install the `llm-key-proxy` command
+uv run keyveil --help
+uv tool install .                                # optional: install the `keyveil` command
 ```
 
 Layout:
 
 ```
-src/llm_key_proxy/proxy.py   the proxy (self-contained, stdlib only)
-llm-proxy.sh                 launcher: decrypt → pipe into the proxy; start/stop/status
-tests/test_proxy.py          offline tests
-.env.example                 template for the file you encrypt
-routes.example.json          template for custom routes
-llm-proxy.conf.example       launcher settings template
+src/keyveil/proxy.py     the proxy (self-contained, stdlib only)
+keyveil.sh               launcher: decrypt → pipe into the proxy; start/stop/status
+tests/test_proxy.py      offline tests
+.env.example             template for the file you encrypt
+routes.example.json      template for custom routes
+keyveil.conf.example     launcher settings template
 ```
 
 ## License

@@ -1,0 +1,6 @@
+# Copy to keyveil.conf (gitignored) and adjust. Not secrets, just paths/settings.
+KEYVEIL_IDENTITY="$HOME/.config/age/identity.txt"   # age identity (e.g. an age-plugin-yubikey stub)
+#KEYVEIL_ENV_FILE="$HOME/.config/keyveil/env.age"   # default: ./.env.age
+#KEYVEIL_PORT=8787
+#KEYVEIL_AGE=rage
+#KEYVEIL_ROUTES=routes.json   # extra routes file (default: ./routes.json if present)

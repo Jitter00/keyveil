@@ -3,7 +3,7 @@
 .env.*
 !.env.example
 *.age
-llm-proxy.conf
+keyveil.conf
 
 # Python / uv
 __pycache__/

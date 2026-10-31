@@ -8,7 +8,7 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from llm_key_proxy import proxy
+from keyveil import proxy
 
 
 class EchoUpstream(BaseHTTPRequestHandler):
