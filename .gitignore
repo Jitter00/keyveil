@@ -1,0 +1,24 @@
+# Secrets — never commit, not even encrypted
+.env
+.env.*
+!.env.example
+*.age
+llm-proxy.conf
+
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local routes (may reveal internal hostnames); routes.example.json is tracked
+routes.json
