@@ -57,6 +57,9 @@ can *use* the proxy while it is up, but it can never *read* the key.
 
 - Listens on `127.0.0.1` only. Routes are `/<name>/...` → an upstream API
   (`/openai/v1/chat/completions` → `https://api.openai.com/v1/chat/completions`).
+- Clients connect to keyveil over plain `http://` on loopback, which never leaves your machine.
+  keyveil always connects to the upstream over `https://`, so the real key only travels
+  encrypted. (The one exception is a `http://` upstream on loopback, e.g. a local gateway.)
 - Drops any credential header the client sent and sets the real one.
 - Streams responses chunk by chunk, so SSE / streaming responses work.
 - Verifies upstream TLS certificates.
@@ -239,7 +242,7 @@ curl -s http://127.0.0.1:8787/netbox/api/dcim/sites/ -H 'Authorization: Token un
   already use your unlocked YubiKey.
 - **Header credentials only.** Keys in the URL/query string, OAuth flows with token refresh,
   request signing (e.g. AWS SigV4) and mutual TLS are not supported.
-- **HTTP only.** No other protocols (SSH, database connections, …), and no WebSocket or
+- **HTTP(S) only.** No other protocols (SSH, database connections, …), and no WebSocket or
   HTTP/2 upstream features.
 - `mlockall` needs a sufficient `ulimit -l`; if it fails it is silently skipped.
 - Prompts and responses pass through the proxy's memory but are never logged.
