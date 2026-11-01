@@ -1,0 +1,141 @@
+# On every merge to main: check, then let semantic-release decide from the conventional
+# commits whether to release (feat -> minor, fix/perf -> patch, others -> nothing).
+# A release builds once, publishes to TestPyPI, then waits for approval before PyPI.
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  checks:
+    # semantic-release's own "chore(release)" commit needs no new checks or release.
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release):') }}
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: checks
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write # push the release commit + tag, create the GitHub Release
+    outputs:
+      released: ${{ steps.semrel.outputs.released }}
+      tag: ${{ steps.semrel.outputs.tag }}
+      version: ${{ steps.semrel.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+      - name: Release exactly the commit that was checked
+        run: git reset --hard "${GITHUB_SHA}"
+      - id: semrel
+        uses: python-semantic-release/python-semantic-release@b700dbeb1f431a0fcc30a79f3f0869407fe07278 # v10.7.0
+        with:
+          # RELEASE_TOKEN (optional secret) is only needed if your main-branch rules don't
+          # let GITHUB_TOKEN push the release commit; see CONTRIBUTING.md.
+          github_token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          git_committer_name: github-actions[bot]
+          git_committer_email: 41898282+github-actions[bot]@users.noreply.github.com
+          build: "false"
+          vcs_release: "true"
+
+  build:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Check the distributions contain only what they should
+        run: python3 scripts/check-dist.py dist "${{ needs.release.outputs.version }}"
+      - name: Smoke-test the built wheel
+        run: ./scripts/smoke-install.sh
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  github-release-assets:
+    needs: [release, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.release.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: python-semantic-release/publish-action@99d4062dd393b5a7a62c5fe9ed78fb364b5674f2 # v10.7.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ needs.release.outputs.tag }}
+
+  deploy-testpypi:
+    needs: [release, build]
+    runs-on: ubuntu-24.04
+    environment:
+      name: testpypi
+      url: https://test.pypi.org/p/keyveil
+    permissions:
+      id-token: write # trusted publishing: no stored token
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3
+        with:
+          repository-url: https://test.pypi.org/legacy/
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - name: Install the uploaded release from TestPyPI and run it
+        env:
+          VERSION: ${{ needs.release.outputs.version }}
+        run: |
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if out=$(uvx --no-cache --index-url https://test.pypi.org/simple/ \
+                       --from "keyveil==${VERSION}" keyveil --version 2>&1); then
+              echo "$out"
+              grep -qF "${VERSION}" <<<"$out" && exit 0
+            fi
+            echo "attempt ${attempt}: not available yet"; sleep 15
+          done
+          echo "::error::keyveil ${VERSION} could not be installed from TestPyPI"; exit 1
+
+  deploy-pypi:
+    needs: [release, deploy-testpypi]
+    runs-on: ubuntu-24.04
+    environment:
+      name: pypi # protected: requires your approval before this job starts
+      url: https://pypi.org/p/keyveil
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # v1.14.3

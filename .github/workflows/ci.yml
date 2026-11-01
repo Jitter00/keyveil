@@ -1,0 +1,82 @@
+# Lint and test on every push and pull request. release.yml reuses this workflow (workflow_call)
+# so main is checked once, by the release pipeline.
+name: CI
+
+on:
+  push:
+    branches-ignore: [main]
+    tags-ignore: ["**"]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+defaults:
+  run:
+    shell: bash # -eo pipefail
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: ruff check
+        run: uv run --locked ruff check --output-format=github
+      - name: ruff format
+        run: uv run --locked ruff format --check
+      - name: shellcheck
+        run: uvx --from shellcheck-py==0.11.0.1 shellcheck scripts/*.sh
+      - name: actionlint
+        run: uvx --from actionlint-py==1.7.12.25 actionlint
+
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+          enable-cache: true
+      - name: Install bubblewrap and allow unprivileged user namespaces
+        # Ubuntu 24.04 restricts user namespaces via AppArmor; without this the live
+        # sandbox tests would skip themselves instead of running.
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - name: Unit tests
+        run: |
+          uv run --locked python -m unittest discover -s tests -v 2>&1 | tee test-output.txt
+          if grep -q "skipped" test-output.txt; then
+            echo "::error::some tests were skipped (bubblewrap not usable on the runner?)"
+            exit 1
+          fi
+
+  smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.13"
+      - name: Build the wheel, install it, drive the real command
+        run: ./scripts/smoke-install.sh

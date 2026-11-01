@@ -729,11 +729,17 @@ Also worth doing, outside keyveil:
 
 ```bash
 uv sync                                          # create the venv (uv fetches Python 3.11+)
+uv run ruff check && uv run ruff format --check  # lint
 uv run python -m unittest discover -s tests -v   # offline tests: no YubiKey, network or real keys
 uv run --python 3.11 python -m unittest discover -s tests   # also try the oldest supported Python
 ./scripts/smoke-install.sh                       # build the wheel, install it, drive the real command
 uv run keyveil --help
 ```
+
+CI runs the same lint and tests on every push and pull request; merges to `main` are released
+automatically from [Conventional Commit](https://www.conventionalcommits.org/) PR titles
+(`feat:` → minor, `fix:` → patch). See [CONTRIBUTING.md](CONTRIBUTING.md) for how releases
+work and [SECURITY.md](SECURITY.md) to report a vulnerability.
 
 The tests run `keyveil` in a sandbox with its own `HOME`, config and port, so they never touch
 your real setup or a running proxy.
@@ -748,6 +754,8 @@ src/keyveil/sandbox.py   builds the bubblewrap command for `keyveil sandbox`
 tests/                   offline tests: proxy, hardening, config, CLI, sandbox (live tests
                          skip themselves if bubblewrap can't run)
 scripts/smoke-install.sh packaging smoke test (builds and installs the wheel)
+scripts/check-dist.py    checks built wheel/sdist contents before publishing
+.github/workflows/       CI (lint, tests), PR-title check, release pipeline
 config.example.toml      the config template (same as `keyveil init` writes)
 routes.example.json      template for custom routes
 .env.example             template for the file you encrypt
