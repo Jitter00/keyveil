@@ -5,15 +5,17 @@ memory**, so the tools making those requests — editors, coding agents, scripts
 never see, store, or inherit the real key.
 
 ```
- editor extensions   ─┐                          ┌─▶ api.anthropic.com   (x-api-key)
- coding agents       ─┼─(dummy key)─▶ 127.0.0.1:8787 ─┼─▶ api.openai.com      (Bearer)
- scripts, SDKs, curl ─┘          keyveil          └─▶ any other API       (Token / custom header)
-                      real keys live only in this process's RAM
+  editor extensions ──┐                           ┌──▶ api.anthropic.com  (x-api-key)
+  coding agents     ──┼──(dummy key)──▶ keyveil ──┼──▶ api.openai.com     (Bearer)
+  scripts, curl     ──┘                           └──▶ any other API      (Token / header)
+                                     127.0.0.1:8787
+                                     real keys: RAM only
 ```
 
-Keys stay encrypted at rest (`.env.age`, decrypted with [age]/[rage], ideally with a hardware
-key such as a YubiKey). They are decrypted once, piped straight into the proxy's stdin, and
-never touch the disk — not even `/run/user` or `/tmp`.
+Keys stay encrypted at rest (by default an `.env.age` file decrypted with [age]/[rage],
+ideally with a hardware key such as a YubiKey; any other decrypt command works too, see
+[Other secret sources](#other-secret-sources)). They are decrypted once, piped straight into
+the proxy's stdin, and never touch the disk — not even `/run/user` or `/tmp`.
 
 It was built to keep LLM provider keys away from AI coding tools, but nothing in it is
 provider-specific: it works for any HTTP API that authenticates with a key or token in a
@@ -54,6 +56,25 @@ With keyveil, only one hardened process holds the key. Code running in your edit
 can *use* the proxy while it is up, but it can never *read* the key.
 
 ## How it works
+
+At start, once (this is the only moment you unlock anything):
+
+```
+  encrypted file ──▶ decrypt command ──▶ KEY=VALUE text ──▶ keyveil process
+  (.env.age)         (age, gpg, sops…)   (a pipe, no file)   keeps keys in RAM
+                            ▲
+                      YubiKey touch
+                      or passphrase
+```
+
+For every request afterwards:
+
+```
+  your tool ──(dummy key)──────▶ keyveil ──(real key, https)──▶ upstream API
+  your tool ◀──(streamed reply)─ keyveil ◀──(reply)──────────── upstream API
+```
+
+The details:
 
 - Listens on `127.0.0.1` only. Routes are `/<name>/...` → an upstream API
   (`/openai/v1/chat/completions` → `https://api.openai.com/v1/chat/completions`).
@@ -122,8 +143,9 @@ crosses a network in clear. A bad routes file makes the proxy refuse to start, w
 
 - Linux (the hardening calls are Linux/glibc; elsewhere it still runs, just without them)
 - Python 3.10+ (standard library only — no dependencies)
-- [age] or [rage] to decrypt; for hardware-backed keys,
-  [age-plugin-yubikey](https://github.com/str4d/age-plugin-yubikey)
+- Something to decrypt your keys: [age] or [rage] by default (for hardware-backed keys,
+  [age-plugin-yubikey](https://github.com/str4d/age-plugin-yubikey)), or any command that prints
+  `KEY=VALUE` lines — see [Other secret sources](#other-secret-sources)
 - Optional: [uv](https://docs.astral.sh/uv/) for development and installing the CLI
 
 ## Setup
@@ -142,8 +164,9 @@ crosses a network in clear. A bad routes file makes the proxy refuse to start, w
 
 3. **Tell the launcher where your identity is.** Copy `keyveil.conf.example` to
    `keyveil.conf` (gitignored) and set `KEYVEIL_IDENTITY`. Other options
-   (`KEYVEIL_ENV_FILE`, `KEYVEIL_PORT`, `KEYVEIL_AGE`, `KEYVEIL_ROUTES`) are documented in
-   the file.
+   (`KEYVEIL_ENV_FILE`, `KEYVEIL_PORT`, `KEYVEIL_AGE`, `KEYVEIL_ROUTES`,
+   `KEYVEIL_DECRYPT_CMD`) are documented in the file. Not using age? Skip steps 1 and 2 and
+   see [Other secret sources](#other-secret-sources).
 
 4. **Optional shell aliases** (adjust the path):
 
@@ -152,6 +175,41 @@ crosses a network in clear. A bad routes file makes the proxy refuse to start, w
    alias veildown='~/path/to/keyveil/keyveil.sh stop'
    alias veilstatus='~/path/to/keyveil/keyveil.sh status'
    ```
+
+### Other secret sources
+
+keyveil itself never touches encryption: the proxy just reads `KEY=VALUE` lines on stdin. The
+launcher produces them by running a decrypt step, which is age by default but can be any shell
+command. Set `KEYVEIL_DECRYPT_CMD` in `keyveil.conf` (or the environment) to a command that
+prints the variables to stdout; it takes priority over the age settings:
+
+```bash
+KEYVEIL_DECRYPT_CMD='gpg -d "$HOME/keys.gpg"'
+KEYVEIL_DECRYPT_CMD='sops -d --output-type dotenv "$HOME/secrets.yaml"'
+KEYVEIL_DECRYPT_CMD='pass show keyveil'     # an entry holding KEY=VALUE lines
+# one secret per command: wrap it in the variable name the route expects
+KEYVEIL_DECRYPT_CMD='printf "ANTHROPIC_API_KEY=%s\n" "$(op read op://Private/Anthropic/credential)"'
+KEYVEIL_DECRYPT_CMD='printf "OPENAI_API_KEY=%s\n" "$(secret-tool lookup service openai)"'
+```
+
+Only age/rage has been tried by the author; the others are plausible examples, not tested
+recipes. By hand, without the launcher, it is the same idea: `<any command> | python3 -I src/keyveil/proxy.py`.
+
+Which source is best depends on what you are defending against. Roughly:
+
+| Source | Good for | Watch out for |
+|---|---|---|
+| **age + hardware key** (default) | Solo use; touch per unlock | You manage the identity and the file |
+| **gpg** (smartcard) | You already use it | `gpg-agent` may cache the unlock, so a program can decrypt without a prompt |
+| **sops** | Teams, secrets in git | A wrapper over age/gpg/KMS; output must be dotenv |
+| **TPM / `systemd-creds`** | Servers, unattended boot | Tied to the machine, no touch step |
+| **OS keyring**, **password manager CLI** | Convenience | Often unlocked at login, so any program running as you can read it |
+| **Vault / cloud secret manager** | Teams, rotation, audit | A server to run; overkill for one person |
+
+Prefer a source that needs a deliberate action each time you unlock (a hardware-key touch, a
+passphrase, a biometric prompt). Then an agent running as you cannot silently re-decrypt your
+keys, and you notice if something tries. Avoid commands that put the secret itself in a
+process's arguments (visible in `ps`).
 
 ## Usage
 
@@ -244,6 +302,8 @@ curl -s http://127.0.0.1:8787/netbox/api/dcim/sites/ -H 'Authorization: Token un
   request signing (e.g. AWS SigV4) and mutual TLS are not supported.
 - **HTTP(S) only.** No other protocols (SSH, database connections, …), and no WebSocket or
   HTTP/2 upstream features.
+- `keyveil.conf` is sourced as shell and `KEYVEIL_DECRYPT_CMD` is run with `eval`, so treat
+  both as code you trust and keep them writable only by you.
 - `mlockall` needs a sufficient `ulimit -l`; if it fails it is silently skipped.
 - Prompts and responses pass through the proxy's memory but are never logged.
 - If decryption yields none of the expected variables, the proxy exits and logs the variable
@@ -263,7 +323,8 @@ Layout:
 ```
 src/keyveil/proxy.py     the proxy (self-contained, stdlib only)
 keyveil.sh               launcher: decrypt → pipe into the proxy; start/stop/status
-tests/test_proxy.py      offline tests
+tests/test_proxy.py      offline tests for the proxy (fake upstream, no real keys)
+tests/test_launcher.py   launcher tests (stub decrypt commands, isolated from your config)
 .env.example             template for the file you encrypt
 routes.example.json      template for custom routes
 keyveil.conf.example     launcher settings template

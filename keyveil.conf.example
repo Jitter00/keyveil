@@ -1,6 +1,16 @@
-# Copy to keyveil.conf (gitignored) and adjust. Not secrets, just paths/settings.
-KEYVEIL_IDENTITY="$HOME/.config/age/identity.txt"   # age identity (e.g. an age-plugin-yubikey stub)
+# Copy to keyveil.conf (gitignored) and adjust. Sourced as shell, so treat it as code.
+# Not secrets, just paths/settings. Pick ONE way of getting your keys:
+
+# 1) age / rage (default): an age identity, e.g. an age-plugin-yubikey stub
+KEYVEIL_IDENTITY="$HOME/.config/age/identity.txt"
 #KEYVEIL_ENV_FILE="$HOME/.config/keyveil/env.age"   # default: ./.env.age
-#KEYVEIL_PORT=8787
 #KEYVEIL_AGE=rage
+
+# 2) Anything else: a command that prints KEY=VALUE lines to stdout (see README,
+#    "Other secret sources"). When set, the age settings above are ignored.
+#KEYVEIL_DECRYPT_CMD='gpg -d "$HOME/keys.gpg"'
+#KEYVEIL_DECRYPT_CMD='sops -d --output-type dotenv "$HOME/secrets.yaml"'
+#KEYVEIL_DECRYPT_CMD='pass show keyveil'
+
+#KEYVEIL_PORT=8787
 #KEYVEIL_ROUTES=routes.json   # extra routes file (default: ./routes.json if present)

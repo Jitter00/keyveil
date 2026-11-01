@@ -22,3 +22,5 @@ build/
 
 # Local routes (may reveal internal hostnames); routes.example.json is tracked
 routes.json
+*.swp
+*.swo
