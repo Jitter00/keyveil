@@ -110,8 +110,6 @@ def build(command, *, project, cfg, home=None, environ=None, extra_rw=(), extra_
     for path in (cfg.age_file, cfg.age_identity):
         if path:
             hide(path)
-    for path in (*cfg.sandbox_hide, *extra_hide):
-        hide(Path(path).expanduser())
 
     for path in (*(home / rel for rel in AGENT_STATE), *cfg.sandbox_rw, *extra_rw):
         path = Path(path).expanduser()
@@ -126,6 +124,11 @@ def build(command, *, project, cfg, home=None, environ=None, extra_rw=(), extra_
         for rel in ("hooks", "config"):
             if (git / rel).exists():
                 argv += ["--ro-bind", str(git / rel), str(git / rel)]
+
+    # User-requested hides go last: a later mount covers an earlier one, so hiding a file
+    # inside a writable path (e.g. ~/.claude/.credentials.json) only works after the binds.
+    for path in (*cfg.sandbox_hide, *extra_hide):
+        hide(Path(path).expanduser())
 
     if ssh_agent:
         sock = environ.get("SSH_AUTH_SOCK")

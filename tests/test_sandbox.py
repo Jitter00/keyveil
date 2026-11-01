@@ -130,6 +130,17 @@ class LiveTests(SandboxCase):
         self.assertFalse((self.project / ".git/hooks/pre-commit").exists())
         self.assertTrue((self.home / ".claude/new").exists())
 
+    def test_hide_works_for_a_file_inside_a_writable_directory(self):
+        # e.g. `--hide ~/.claude/.credentials.json` while ~/.claude itself is writable.
+        creds = self.home / ".claude" / ".credentials.json"
+        creds.write_text("OAUTH-TOKEN\n")
+        out = self.run_inside(r'''
+            echo "creds=$(cat ~/.claude/.credentials.json 2>/dev/null)"
+            echo "sibling=$( (echo x > ~/.claude/settings.json) 2>/dev/null && echo writable || echo no)"
+        ''', "--hide", str(creds))
+        self.assertEqual(out, {"creds": "", "sibling": "writable"})
+        self.assertEqual(creds.read_text(), "OAUTH-TOKEN\n")        # untouched on the host
+
     def test_loopback_reachable_processes_invisible_env_stripped(self):
         srv = socket.socket()
         srv.bind(("127.0.0.1", 0))

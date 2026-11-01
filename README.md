@@ -136,17 +136,17 @@ Type your passphrase when asked. You should see `ok — keyveil on 127.0.0.1:878
 in the background. (After a reboot, run `keyveil start` again.) Useful: `keyveil status`,
 `keyveil stop`.
 
-**Step 7 — point a tool at it.** For example Claude Code: add this to
-`~/.claude/settings.json` (create the file if needed; if it already has other settings, add
-just the `"env"` part):
+**Step 7 — point a tool at it.** For example Claude Code, for one session:
 
-```json
-{ "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/anthropic",
-           "ANTHROPIC_AUTH_TOKEN": "local-proxy" } }
+```bash
+claude --settings '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8787/anthropic","ANTHROPIC_AUTH_TOKEN":"local-proxy"}}'
 ```
 
-`local-proxy` is a made-up placeholder, not a credential. Settings for Cline, Continue, Python
-scripts and others are in [Point your tools at it](#point-your-tools-at-it).
+`local-proxy` is a made-up placeholder, not a credential. Don't put those two variables in
+`~/.claude/settings.json`: they would override your Claude subscription login for every
+session ([why, and how to make a short command for this](#claude-code-subscription-or-api-key)).
+Settings for Cline, Continue, Python scripts and others are in
+[Point your tools at it](#point-your-tools-at-it).
 
 **Step 8 (recommended) — run coding agents confined.** An agent running as you can do
 anything you can do. This runs it in a sandbox where it can edit your project and use
@@ -454,22 +454,8 @@ rage -d -i identity.txt env.age | keyveil run --stdin --port 8787
 Use any non-empty dummy key (e.g. `local-proxy`) — it is not a credential. The pattern is always
 the same: base URL `http://127.0.0.1:8787/<route>/…`, dummy key.
 
-**Claude Code** (needs `ANTHROPIC_API_KEY` in the encrypted file; keep that name there — the dummy
-below is only a client-side placeholder). In `~/.claude/settings.json`:
-
-```json
-{ "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/anthropic",
-           "ANTHROPIC_AUTH_TOKEN": "local-proxy" } }
-```
-
-Notes:
-- Don't also export the real key in your shell, or Claude's environment would hold it again.
-- With this in the user-level file, `claude` fails with a connection error whenever keyveil
-  isn't running. To limit it to one project use `.claude/settings.local.json`, or to one
-  session use `claude --settings '{"env": {...}}'`.
-- Values in a settings file's `env` block override variables set in your shell. If you have
-  an alias that sets its own `ANTHROPIC_BASE_URL` (say, for another gateway), pass it with
-  `--settings` too — that flag outranks the user-level file.
+**Claude Code:** see [Claude Code: subscription or API key](#claude-code-subscription-or-api-key)
+below. (It needs `ANTHROPIC_API_KEY` in the encrypted file; keep that name there.)
 
 **OpenAI-compatible tools** (Continue, Cline, Aider, SDKs…): set the base URL to
 `http://127.0.0.1:8787/<route>/v1` and the API key to the dummy. For example, Continue
@@ -504,6 +490,66 @@ client = Anthropic(base_url="http://127.0.0.1:8787/anthropic", api_key="local-pr
 ```bash
 curl -s http://127.0.0.1:8787/netbox/api/dcim/sites/ -H 'Authorization: Token unused'
 ```
+
+### Claude Code: subscription or API key
+
+Claude Code can authenticate in two ways, and uses only one at a time:
+
+| Mode | How you start it | Billing | Uses keyveil? |
+|---|---|---|---|
+| **Subscription** (claude.ai login) | plain `claude` | your Claude plan | no |
+| **API key through keyveil** | `claude --settings '…'` (below) | Anthropic API, pay per use | yes |
+
+**Why they can't both be "on".** Claude Code uses the first credential it finds, in this order:
+a cloud-provider setting, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`, `apiKeyHelper`,
+`CLAUDE_CODE_OAUTH_TOKEN`, and only then your saved login. The placeholder token that keyveil
+mode needs (`ANTHROPIC_AUTH_TOKEN`) therefore outranks your subscription, and Claude prints
+*"claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set…"*.
+So **don't put the proxy variables in `~/.claude/settings.json` or your shell profile**: give
+them only to the sessions that should use keyveil. Your saved login stays on disk and works
+again as soon as those variables are absent.
+
+**Log in with your subscription** (once, in a normal terminal): `claude auth login`, or
+`/login` inside Claude. A browser opens; if there is none (a server, SSH), press `c` to copy
+the link, open it on another device, and paste the code back. `claude auth status --text`
+shows which credential is active.
+
+**Use keyveil for one session:**
+
+```bash
+claude --settings '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8787/anthropic","ANTHROPIC_AUTH_TOKEN":"local-proxy"}}'
+```
+
+`--settings` outranks your user settings file and applies to that session only. **Always set
+both variables, never just one:** with only the base URL set, Claude would send your
+subscription token to keyveil, which replaces it with the API key, so you would be billed on
+the API without noticing. In this mode `claude` fails with "connection refused" whenever
+keyveil isn't running.
+
+**Short commands.** Add these to `~/.bashrc`, then open a new terminal:
+
+```bash
+claude-proxy()     { claude --settings '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8787/anthropic","ANTHROPIC_AUTH_TOKEN":"local-proxy"}}' "$@"; }
+claude-box()       { keyveil sandbox -- claude "$@"; }
+claude-proxy-box() { keyveil sandbox --hide "$HOME/.claude/.credentials.json" -- claude --settings '{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:8787/anthropic","ANTHROPIC_AUTH_TOKEN":"local-proxy"}}' "$@"; }
+```
+
+| Command | Auth | Confined? |
+|---|---|---|
+| `claude` | subscription | no |
+| `claude-box` | subscription | yes ([sandbox](#confine-your-agents-keyveil-sandbox)) |
+| `claude-proxy` | API key via keyveil | no |
+| `claude-proxy-box` | API key via keyveil | yes, and your subscription login file is hidden from the agent |
+
+**Heads-up: keyveil does not protect your subscription login.** Claude Code stores it as a
+plain token in `~/.claude/.credentials.json` (readable only by you, but by any program running
+as you). A confined agent in `claude-box` can read it too, because Claude needs its own folder.
+In `claude-proxy-box` that file is hidden, since the agent doesn't need it. For agents you
+trust less, prefer the keyveil modes.
+
+Also: values in a settings file's `env` block override variables set in your shell. If you
+have an alias that sets its own `ANTHROPIC_BASE_URL` (say, for another gateway), pass it with
+`--settings` too.
 
 ## Confine your agents: `keyveil sandbox`
 
@@ -569,7 +615,7 @@ everything else keeps working:
 | Inside the sandbox | |
 |---|---|
 | The project directory | read-write (`.git/hooks` and `.git/config` read-only: they run code later, outside) |
-| Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write |
+| Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write (this includes your subscription login file unless you `--hide` it) |
 | The rest of the filesystem | read-only: your tools work, but `~/.bashrc`, PATH, keyveil's install and config can't be changed |
 | `/run`, `/tmp`, `~/.cache` | private and empty: no Docker/LXD/libvirt/ssh-agent/keyring sockets |
 | `~/.ssh`, `~/.gnupg`, cloud CLI credentials, browser profiles, shell history, keyveil's config, your encrypted key file and identity | hidden |
@@ -579,9 +625,11 @@ everything else keeps working:
 | Network | shared: the internet and keyveil on `127.0.0.1` work |
 
 Options: `--project DIR`, `--rw PATH` / `--hide PATH` (or `[sandbox] rw = [...]`, `hide = [...]`
-in `config.toml`), `--keep-env NAME` (e.g. if you pass `ANTHROPIC_AUTH_TOKEN=local-proxy` in the
-environment instead of `settings.json`), `--ssh-agent`, and `--dry-run` to print the exact
-`bwrap` command without running it. It refuses to make your whole home directory writable.
+in `config.toml`), `--keep-env NAME` (keep one variable the sandbox would otherwise remove), `--ssh-agent`,
+and `--dry-run` to print the exact `bwrap` command without running it. `--hide` also works on
+a single file inside a writable folder, e.g. `--hide ~/.claude/.credentials.json`. It refuses
+to make your whole home directory writable. Shortcuts for Claude Code are in
+[Claude Code: subscription or API key](#claude-code-subscription-or-api-key).
 
 It doesn't cover:
 - **Editor extensions** (Cline, Continue…): they run inside the editor's own process, so
@@ -599,6 +647,7 @@ namespaces (default on most distributions).
 
 | What you see | Why | What to do |
 |---|---|---|
+| Claude Code says *"claude.ai connectors are disabled because ANTHROPIC_API_KEY or another auth source is set…"* | The keyveil placeholder token (`ANTHROPIC_AUTH_TOKEN`) is set globally and outranks your subscription login | Remove the `ANTHROPIC_*` variables from `~/.claude/settings.json` and your shell profile; use them per session only ([how](#claude-code-subscription-or-api-key)) |
 | `keyveil: command not found` | The terminal doesn't know where `uv` installed it, or you are inside the sandbox (where it is hidden on purpose) | Run `uv tool update-shell` and open a new terminal. In the sandbox, use a normal terminal for keyveil commands |
 | A tool says "connection refused" | keyveil isn't running (it doesn't survive a reboot) | `keyveil status`, then `keyveil start` |
 | `keyveil: port 8787 is already in use by another process` | Another program uses that port | Set a different `port = 8788` in `config.toml` (and in your tools' base URL), or stop the other program |
