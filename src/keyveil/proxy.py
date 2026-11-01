@@ -17,6 +17,7 @@ import argparse
 import ctypes
 import fnmatch
 import http.client
+import ipaddress
 import json
 import re
 import signal
@@ -75,12 +76,29 @@ def auth_header(style, key):
     raise ValueError("unknown auth style %r" % style)
 
 
+_PRIVATE_NETS = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12",
+                                                          "192.168.0.0/16"))
+
+
+def _private_ip(host):
+    """True if ``host`` is a literal IPv4 address in an RFC 1918 private range.
+
+    Hostnames never qualify: DNS could point them anywhere, so plain http to one would let a
+    key cross a network in clear.
+    """
+    try:
+        ip = ipaddress.ip_address(host or "")
+    except ValueError:
+        return False
+    return ip.version == 4 and any(ip in net for net in _PRIVATE_NETS)
+
+
 def validate_route(name, spec):
     """Validate one entry of a routes file; return the ROUTES tuple."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", name):
         raise ValueError("route name %r: use letters, digits, '-' and '_'" % name)
     if isinstance(spec, dict):  # a typo like "alow" must not silently drop a restriction
-        unknown = sorted(set(spec) - {"upstream", "env", "auth", "allow"})
+        unknown = sorted(set(spec) - {"upstream", "env", "auth", "allow", "allow_http"})
         if unknown:
             raise ValueError("route %r: unknown key(s) %s" % (name, ", ".join(unknown)))
     try:
@@ -89,12 +107,21 @@ def validate_route(name, spec):
         raise ValueError("route %r needs 'upstream' and 'env' (optional 'auth')" % name)
     auth_header(style, "x")  # raises on unknown style
     u = urlsplit(upstream)
+    allow_http = spec.get("allow_http", False)
+    if not isinstance(allow_http, bool):
+        raise ValueError("route %r: 'allow_http' must be true or false" % name)
     if u.scheme == "https":
         pass
     elif u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost", "::1"):
         pass  # plain http is only allowed for loopback backends (keys must not cross a network in clear)
+    elif u.scheme == "http" and allow_http and _private_ip(u.hostname):
+        pass  # explicit opt-in: plain http to a literal private address (e.g. a local VM)
+    elif u.scheme == "http" and allow_http:
+        raise ValueError("route %r: allow_http only works with a literal private IP address "
+                         "(10.x, 172.16-31.x, 192.168.x), not %r" % (name, u.hostname))
     else:
-        raise ValueError("route %r: upstream must be https:// (or http:// on localhost)" % name)
+        raise ValueError("route %r: upstream must be https:// (or http:// on localhost; "
+                         "for a private-network IP set \"allow_http\": true)" % name)
     if not u.netloc:
         raise ValueError("route %r: upstream has no host" % name)
     return (upstream, env_name, style)

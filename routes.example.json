@@ -11,6 +11,12 @@
       "env": "INTERNAL_API_KEY",
       "auth": "header:X-Auth-Token"
     },
+    "vm-netbox": {
+      "upstream": "http://192.168.1.50:8000",
+      "env": "NETBOX_VM_TOKEN",
+      "auth": "token",
+      "allow_http": true
+    },
     "local-gateway": {
       "upstream": "http://127.0.0.1:4000",
       "env": "GATEWAY_KEY",

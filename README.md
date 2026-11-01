@@ -313,6 +313,23 @@ plain `http://` is accepted only for loopback (`localhost`, `127.0.0.1`), so a k
 crosses a network in clear. A bad routes file (including a misspelled key) makes the proxy
 refuse to start, with a message.
 
+**Plain `http://` to a device on your private network.** A NetBox in a virtual machine on
+your own computer, or a lab server, often has no HTTPS. For that case a route can opt in with
+`"allow_http": true`:
+
+```json
+"netbox": { "upstream": "http://192.168.1.50:8000", "env": "NETBOX_TOKEN", "auth": "token",
+            "allow_http": true }
+```
+
+It only works for an `http://` upstream given as a **literal private IP address** (`10.x.x.x`,
+`172.16–31.x.x`, `192.168.x.x`). Hostnames and public addresses are always refused, because
+DNS could point a name somewhere else and the key would cross a network unencrypted. Even with
+the opt-in, the key is sent unencrypted from your computer to that address: use it only for
+machines you trust and a network nobody else can listen on (a VM on your own computer is the
+safest case). `auth` must match the token type: NetBox's older tokens use `token`, but its newer
+ones (they start with `nbt_`) need `bearer`.
+
 **Limit what a route can do** with an optional `allow` list of `"METHOD /path"` patterns
 (`*` is a wildcard, the query string is ignored, `HEAD` counts as `GET`). Anything else gets
 `403`. Without `allow`, every path is permitted.

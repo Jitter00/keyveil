@@ -251,6 +251,55 @@ class GuardedProxyTests(unittest.TestCase):
                 target.update(s)
 
 
+class AllowHttpTests(unittest.TestCase):
+    """Plain http upstreams: loopback always; private literal IPs only with "allow_http"."""
+
+    def route(self, upstream, **extra):
+        return proxy.validate_route("r", dict({"upstream": upstream, "env": "K"}, **extra))
+
+    def test_private_literal_ips_need_the_opt_in(self):
+        for host in ("10.1.2.3", "172.16.0.9", "172.31.255.254", "192.168.1.50:8000"):
+            url = "http://%s/base" % host
+            with self.assertRaises(ValueError, msg=url):          # no opt-in: still refused
+                self.route(url)
+            with self.assertRaises(ValueError, msg=url):
+                self.route(url, allow_http=False)
+            self.assertEqual(self.route(url, allow_http=True), (url, "K", "bearer"), url)
+
+    def test_the_opt_in_never_allows_anything_that_could_leave_the_machine(self):
+        refused = ["http://203.0.113.5", "http://8.8.8.8", "http://172.32.0.1", "http://172.15.0.1",
+                   "http://192.169.1.1", "http://11.0.0.1", "http://169.254.1.1",
+                   "http://netbox.example.com", "http://netbox.local", "http://localhost.evil.com",
+                   "http://192.168.1.1.evil.com", "http://192.168.1.1@evil.example.com",
+                   "http://[::ffff:192.168.1.1]", "http://[fd00::1]", "http://0xc0a80101",
+                   "http://3232235777", "http://192.168.001.001"]
+        for url in refused:
+            with self.assertRaises(ValueError, msg=url):
+                self.route(url, allow_http=True)
+
+    def test_https_and_loopback_work_without_it_and_the_flag_must_be_a_bool(self):
+        for url in ("https://nb.example.com", "http://127.0.0.1:4000", "http://localhost:4000"):
+            self.assertEqual(self.route(url)[0], url)
+            self.assertEqual(self.route(url, allow_http=True)[0], url)   # harmless there
+        for bad in ("true", 1, None, "yes"):
+            with self.assertRaises(ValueError, msg=bad):
+                self.route("http://192.168.1.1", allow_http=bad)
+
+    def test_routes_file_accepts_the_opt_in(self):
+        saved = dict(proxy.ROUTES)
+        spec = {"routes": {"nb": {"upstream": "http://192.168.1.50:8000", "env": "NB",
+                                  "auth": "token", "allow_http": True}}}
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(spec, f)
+        try:
+            proxy.load_routes_file(f.name)
+            self.assertEqual(proxy.ROUTES["nb"], ("http://192.168.1.50:8000", "NB", "token"))
+        finally:
+            os.unlink(f.name)
+            proxy.ROUTES.clear()
+            proxy.ROUTES.update(saved)
+
+
 class IdleShutdownTests(unittest.TestCase):
     def run_proxy(self, *args, env_text="DEEPSEEK_API_KEY=x\n"):
         port = free_port()
