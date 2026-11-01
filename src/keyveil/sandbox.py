@@ -7,20 +7,32 @@ keyveil proxy on 127.0.0.1. What it can no longer do:
   * tamper with what runs outside the sandbox: everything except the project and the agent's
     own state is read-only (~/.bashrc, PATH, keyveil's install and config, .git/hooks, ...);
   * read common secret stores (~/.ssh, ~/.gnupg, cloud CLI credentials, browser profiles...);
-  * see or signal other processes (own PID namespace), including the keyveil proxy.
-Network access is shared with the host (the agent needs the proxy and usually the internet).
+  * see or signal other processes (own PID namespace), including the keyveil proxy;
+  * reach anything on the host's loopback or abstract Unix sockets (X11, D-Bus, ibus...):
+    the agent gets its own network namespace. slirp4netns gives it the internet, and a
+    relay gives it the keyveil proxy at the usual 127.0.0.1:<port>, and nothing else.
 """
 
 import fnmatch
+import json
 import os
 import shlex
 import shutil
+import signal
+import socket
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
+from . import bridge, proxy
 from . import config as cfgmod
-from . import proxy
+
+# --network modes: own namespace with internet (slirp4netns), own namespace with only the
+# proxy, or the host's network (no isolation from loopback services or abstract sockets).
+NETWORK_MODES = cfgmod.SANDBOX_NETWORKS
+BRIDGE_MOUNT = "/run/keyveil"  # where the relay's directory appears inside the sandbox
+SLIRP_RESOLV = "nameserver 10.0.2.3\n"  # slirp4netns' built-in DNS forwarder
 
 # Hidden from the agent if they exist (relative to $HOME). Directories get an empty tmpfs,
 # files are replaced by /dev/null.
@@ -143,10 +155,20 @@ def build(
     keep_env=(),
     ssh_agent=False,
     prefix=None,
+    network="isolated",
+    port=cfgmod.DEFAULT_PORT,
+    bridge_dir=None,
 ):
-    """Return (bwrap argv, removed env var names, warnings). Pure: inspects but never runs."""
+    """Return (bwrap argv, removed env var names, warnings). Pure: inspects but never runs.
+
+    Unless ``network`` is "host", the argv expects ``run()`` to have prepared
+    ``bridge_dir`` (the proxy relay socket, bridge.py and resolv.conf).
+    """
     if not command:
         raise SandboxError("no command given. Usage: keyveil sandbox [options] -- COMMAND [ARGS]")
+    if network not in NETWORK_MODES:
+        raise SandboxError("unknown network mode %r (use %s)" % (network, ", ".join(NETWORK_MODES)))
+    bridge_dir = Path(bridge_dir or default_bridge_dir())
     home = Path(home or Path.home()).resolve()
     environ = os.environ if environ is None else environ
     project = Path(project).resolve()
@@ -170,11 +192,21 @@ def build(
         "--tmpfs",
         "/tmp",  # noqa: S108 - a mount point inside the sandbox, not a temp file
     ]
-    # /etc/resolv.conf is often a symlink into /run (systemd-resolved); give back just that
-    # file, read-only, so DNS keeps working. The resolver's control socket stays hidden.
     resolv = Path("/etc/resolv.conf").resolve()
-    if Path("/run") in resolv.parents and resolv.is_file():
-        argv += ["--ro-bind", str(resolv), str(resolv)]
+    if network == "host":
+        # /etc/resolv.conf is often a symlink into /run (systemd-resolved); give back just
+        # that file, read-only, so DNS keeps working. The resolver's socket stays hidden.
+        if Path("/run") in resolv.parents and resolv.is_file():
+            argv += ["--ro-bind", str(resolv), str(resolv)]
+        warnings.append(
+            "--network host: the agent shares your network namespace, so it can reach every "
+            "service on 127.0.0.1 and abstract Unix sockets such as your X11 display (which "
+            "lets it type into other windows). Use it only if isolated/none can't work"
+        )
+    else:
+        argv += ["--unshare-net", "--ro-bind", str(bridge_dir), BRIDGE_MOUNT]
+        if network == "isolated":  # DNS through slirp4netns
+            argv += ["--ro-bind", str(bridge_dir / "resolv.conf"), str(resolv)]
     runtime = environ.get("XDG_RUNTIME_DIR")
     if runtime and Path("/run") in Path(runtime).parents:  # recreate it, empty, on the new /run
         argv += ["--dir", runtime, "--chmod", "0700", runtime]
@@ -240,12 +272,191 @@ def build(
     for name in removed:
         argv += ["--unsetenv", name]
 
+    if network != "host":  # start the proxy relay inside, then the command
+        command = [
+            _bridge_python(hidden),
+            "-I",
+            BRIDGE_MOUNT + "/bridge.py",
+            str(port),
+            BRIDGE_MOUNT + "/proxy.sock",
+            "--",
+            *command,
+        ]
     argv += ["--chdir", str(project), "--", *command]
     return argv, removed, warnings
 
 
-def preflight():
-    """Fail early with a helpful message if bwrap can't run here."""
+def _bridge_python(hidden):
+    """An interpreter for bridge.py that is visible inside the sandbox."""
+    for candidate in (os.path.realpath(sys.executable), "/usr/bin/python3"):
+        path = Path(candidate)
+        if path.is_file() and not any(h == path or h in path.parents for h in hidden):
+            return str(path)
+    raise SandboxError("no python3 interpreter visible inside the sandbox for the proxy relay")
+
+
+def default_bridge_dir():
+    """Host directory for this session's proxy relay (private; removed when it ends)."""
+    return cfgmod.runtime_dir() / ("sandbox-%d" % os.getpid())
+
+
+# ---------------------------------------------------------------- running it
+
+
+def run(argv, *, network, port, bridge_dir=None):
+    """Run the bwrap ``argv`` from ``build()`` and return its exit status.
+
+    Unless ``network`` is "host": serves the proxy relay socket for the sandbox and, for
+    "isolated", attaches slirp4netns to the sandbox's network namespace before the command
+    starts. Ctrl-C goes to the agent (we ignore it); SIGTERM/SIGHUP are forwarded.
+    """
+    bridge_dir = Path(bridge_dir or default_bridge_dir())
+    relay = None
+    try:
+        if network != "host":
+            relay = _start_relay(bridge_dir, port)
+        return _supervise(argv, network)
+    finally:
+        if relay is not None:
+            relay.close()
+            shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+def _start_relay(bridge_dir, port):
+    """Prepare ``bridge_dir`` and relay its proxy.sock to the proxy on 127.0.0.1:port."""
+    bridge_dir.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shutil.rmtree(bridge_dir, ignore_errors=True)  # stale, from a crashed run with our pid
+    bridge_dir.mkdir(mode=0o700)
+    (bridge_dir / "bridge.py").write_text(Path(bridge.__file__).read_text())
+    (bridge_dir / "resolv.conf").write_text(SLIRP_RESOLV)
+    srv = socket.socket(socket.AF_UNIX)
+    srv.bind(str(bridge_dir / "proxy.sock"))
+    srv.listen(64)
+
+    def connect():
+        conn = socket.create_connection(("127.0.0.1", port), timeout=10)
+        conn.settimeout(None)  # long, quiet streamed responses must not time out
+        return conn
+
+    bridge.serve([srv], connect)
+    return srv
+
+
+def _read_child_pid(fd):
+    """Read bwrap's --info-fd JSON (it may arrive in pieces); None if bwrap failed first."""
+    buf = b""
+    while True:
+        chunk = os.read(fd, 4096)
+        if not chunk:
+            return None
+        buf += chunk
+        try:
+            return json.loads(buf)["child-pid"]
+        except ValueError:
+            continue
+
+
+def _start_slirp(pid):
+    """Attach slirp4netns to ``pid``'s network namespace; return (process, exit fd)."""
+    ready_r, ready_w = os.pipe()
+    exit_r, exit_w = os.pipe()  # slirp4netns exits when we close exit_w (or die)
+    errors = tempfile.TemporaryFile()
+    slirp = subprocess.Popen(  # noqa: S603 - fixed argv
+        [  # noqa: S607 - slirp4netns from PATH, like bwrap
+            "slirp4netns",
+            "--configure",
+            "--mtu=65520",
+            "--disable-host-loopback",
+            "--ready-fd=%d" % ready_w,
+            "--exit-fd=%d" % exit_r,
+            "--userns-path=/proc/%d/ns/user" % pid,
+            str(pid),
+            "tap0",
+        ],
+        pass_fds=(ready_w, exit_r),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=errors,
+    )
+    os.close(ready_w)
+    os.close(exit_r)
+    ready = os.read(ready_r, 1)
+    os.close(ready_r)
+    if ready != b"1":
+        os.close(exit_w)
+        slirp.wait()
+        errors.seek(0)
+        detail = errors.read().decode("utf-8", "replace").strip().splitlines()
+        raise SandboxError(
+            "slirp4netns could not set up the sandbox network (%s)"
+            % (detail[-1] if detail else "exit %s" % slirp.returncode)
+        )
+    errors.close()
+    return slirp, exit_w
+
+
+def _supervise(argv, network):
+    fds = []
+    if network == "isolated":
+        info_r, info_w = os.pipe()
+        block_r, block_w = os.pipe()
+        argv = [argv[0], "--info-fd", str(info_w), "--block-fd", str(block_r), *argv[1:]]
+        fds = [info_w, block_r]
+    handled = (signal.SIGINT, signal.SIGQUIT, signal.SIGTERM, signal.SIGHUP)
+    saved = {s: signal.getsignal(s) for s in handled}
+    proc = slirp = None
+    try:
+        proc = subprocess.Popen(argv, pass_fds=fds)  # noqa: S603 - argv built by build()
+        # After Popen: an ignored signal would be inherited by the agent.
+        for s in (signal.SIGINT, signal.SIGQUIT):  # the terminal sends these to the agent too
+            signal.signal(s, signal.SIG_IGN)
+        for s in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(s, lambda signum, _frame: proc.send_signal(signum))
+        if network == "isolated":
+            for fd in fds:
+                os.close(fd)
+            fds = [info_r, block_w]
+            pid = _read_child_pid(info_r)
+            if pid is None:
+                return proc.wait()  # bwrap failed before starting; it said why
+            slirp = _start_slirp(pid)
+            os.write(block_w, b"1")  # network ready: let the command start
+        return proc.wait()
+    finally:
+        for fd in fds:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if slirp is not None:
+            process, exit_w = slirp
+            os.close(exit_w)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        for s, handler in saved.items():
+            signal.signal(s, handler)
+
+
+def preflight(network="host"):
+    """Fail early with a helpful message if bwrap (or slirp4netns) can't run here."""
+    if network == "isolated":
+        if not shutil.which("slirp4netns"):
+            raise SandboxError(
+                "slirp4netns is not installed (Ubuntu/Debian: sudo apt install slirp4netns). "
+                "It gives the sandbox internet access without sharing your network. "
+                "Alternatives: --network none (only the keyveil proxy, no internet)"
+            )
+        if not Path("/dev/net/tun").exists():
+            raise SandboxError(
+                "/dev/net/tun is missing, so slirp4netns can't work here (are you inside a "
+                "container or another sandbox?). Use --network none (only the keyveil proxy)"
+            )
     if not shutil.which("bwrap"):
         raise SandboxError(
             "bubblewrap is not installed (Ubuntu/Debian: sudo apt install bubblewrap)"
@@ -264,5 +475,13 @@ def preflight():
         )
 
 
-def describe(argv):
-    return shlex.join(argv)
+def describe(argv, network="host"):
+    text = shlex.join(argv)
+    if network != "host":
+        text += "\n# plus: a relay from %s/proxy.sock to the proxy on 127.0.0.1" % BRIDGE_MOUNT
+    if network == "isolated":
+        text += (
+            "\n# plus: slirp4netns --configure --mtu=65520 --disable-host-loopback, attached "
+            "to the sandbox's network namespace before the command starts"
+        )
+    return text

@@ -239,6 +239,8 @@ def cmd_sandbox(args):
             proxy.load_routes_file(cfg.routes_file)
         except (OSError, ValueError) as e:
             raise CLIError("bad routes file %s: %s" % (cfg.routes_file, e)) from e
+    network = args.network or cfg.sandbox_network
+    bridge_dir = sandbox.default_bridge_dir()
     try:
         argv, removed, warnings = sandbox.build(
             args.command,
@@ -248,11 +250,14 @@ def cmd_sandbox(args):
             extra_hide=args.hide,
             keep_env=args.keep_env,
             ssh_agent=args.ssh_agent,
+            network=network,
+            port=cfg.port,
+            bridge_dir=bridge_dir,
         )
         if args.dry_run:
-            print(sandbox.describe(argv))
+            print(sandbox.describe(argv, network))
             return 0
-        sandbox.preflight()
+        sandbox.preflight(network)
     except sandbox.SandboxError as e:
         raise CLIError(str(e)) from e
     for w in warnings:
@@ -264,7 +269,10 @@ def cmd_sandbox(args):
         )
     sys.stdout.flush()
     sys.stderr.flush()
-    os.execvp(argv[0], argv)  # noqa: S606 - replace ourselves with bwrap (argv list, no shell)
+    try:
+        return sandbox.run(argv, network=network, port=cfg.port, bridge_dir=bridge_dir)
+    except sandbox.SandboxError as e:
+        raise CLIError(str(e)) from e
 
 
 def cmd_init(args):
@@ -375,6 +383,12 @@ def build_parser():
         "--ssh-agent",
         action="store_true",
         help="give the agent your ssh-agent socket (e.g. for git push over ssh)",
+    )
+    p.add_argument(
+        "--network",
+        choices=cfgmod.SANDBOX_NETWORKS,
+        help="isolated (default): own network with internet via slirp4netns; none: only the "
+        "keyveil proxy; host: share your network (not isolated, see README)",
     )
     p.add_argument("--dry-run", action="store_true", help="print the bwrap command and exit")
     p.add_argument(

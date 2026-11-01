@@ -31,6 +31,7 @@ port = 8787
 # [sandbox]
 # rw = ["~/.npm"]           # also writable (default: the project, ~/.claude, ~/.claude.json)
 # hide = ["~/secrets"]      # also hidden (default: ~/.ssh, ~/.gnupg, keyveil's files, ...)
+# network = "isolated"      # "isolated" (default; needs slirp4netns), "none" or "host"
 """
 
 
@@ -70,13 +71,15 @@ class Config:
     idle_timeout: float = 0.0  # seconds; 0 = never
     sandbox_rw: tuple = ()  # extra writable paths for `keyveil sandbox`
     sandbox_hide: tuple = ()  # extra hidden paths for `keyveil sandbox`
+    sandbox_network: str = "isolated"  # `keyveil sandbox` network mode
     source: Path | None = None  # the file this was loaded from, if any
 
 
 _TOP = {"port", "routes_file", "idle_timeout", "age", "decrypt", "sandbox"}
 _AGE = {"identity", "file", "binary"}
 _DECRYPT = {"command"}
-_SANDBOX = {"rw", "hide"}
+_SANDBOX = {"rw", "hide", "network"}
+SANDBOX_NETWORKS = ("isolated", "none", "host")
 
 
 def _path_list(table, key, where):
@@ -106,6 +109,15 @@ def _table(data, key, where):
     value = data.get(key, {})
     if not isinstance(value, dict):
         raise ConfigError("%s: [%s] must be a table" % (where, key))
+    return value
+
+
+def _network(table, where):
+    value = table.get("network", "isolated")
+    if value not in SANDBOX_NETWORKS:
+        raise ConfigError(
+            "%s: 'network' must be one of %s" % (where, ", ".join(map(repr, SANDBOX_NETWORKS)))
+        )
     return value
 
 
@@ -164,5 +176,6 @@ def load(path=None, *, port=None, decrypt_command=None):
         idle_timeout=float(idle) * 60,
         sandbox_rw=_path_list(box, "rw", where + " [sandbox]"),
         sandbox_hide=_path_list(box, "hide", where + " [sandbox]"),
+        sandbox_network=_network(box, where + " [sandbox]"),
         source=source,
     )

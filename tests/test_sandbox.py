@@ -4,6 +4,7 @@ because the sandbox replaces /tmp and that would make "hidden" checks pass trivi
 
 import dataclasses
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -28,6 +29,10 @@ def bwrap_works():
         ).returncode
         == 0
     )
+
+
+def slirp_works():
+    return bool(shutil.which("slirp4netns")) and Path("/dev/net/tun").exists()
 
 
 class SandboxCase(unittest.TestCase):
@@ -156,9 +161,39 @@ class BuildTests(SandboxCase):
             self.build(ssh_agent=True, environ={})
 
     def test_command_comes_last_and_unchanged(self):
-        argv, _, _ = self.build(command=["sh", "-c", "echo 'a b'", "--", "-x"])
-        self.assertEqual(argv[argv.index("--") + 1 :], ["sh", "-c", "echo 'a b'", "--", "-x"])
+        command = ["sh", "-c", "echo 'a b'", "--", "-x"]
+        argv, _, _ = self.build(command=command, network="host")
+        self.assertEqual(argv[argv.index("--") + 1 :], command)
         self.assertEqual(argv[0], "bwrap")
+        # With its own network the command is started by the proxy relay, unchanged.
+        argv, _, _ = self.build(command=command, port=9999)
+        inner = argv[argv.index("--") + 1 :]
+        self.assertEqual(
+            inner[1:6], ["-I", "/run/keyveil/bridge.py", "9999", "/run/keyveil/proxy.sock", "--"]
+        )
+        self.assertEqual(inner[6:], command)
+
+    def test_network_modes(self):
+        bridge = self.root / "bridge"
+        for mode in ("isolated", "none"):
+            argv, _, warnings = self.build(network=mode, bridge_dir=bridge)
+            self.assertIn("--unshare-net", argv)
+            i = argv.index(str(bridge))
+            self.assertEqual(argv[i - 1 : i + 2], ["--ro-bind", str(bridge), "/run/keyveil"])
+            self.assertEqual(
+                str(bridge / "resolv.conf") in argv, mode == "isolated", mode
+            )  # slirp's DNS only where there is a network to use it
+            self.assertFalse(any("--network host" in w for w in warnings))
+        argv, _, warnings = self.build(network="host", bridge_dir=bridge)
+        self.assertNotIn("--unshare-net", argv)
+        self.assertNotIn(str(bridge), argv)
+        self.assertTrue(any("X11" in w for w in warnings))
+        with self.assertRaises(sandbox.SandboxError):
+            self.build(network="bogus")
+
+    def test_relay_interpreter_is_never_a_hidden_one(self):
+        hidden = [Path(os.path.realpath(sys.executable)).parent]
+        self.assertEqual(sandbox._bridge_python(hidden), "/usr/bin/python3")
 
 
 @unittest.skipUnless(
@@ -166,11 +201,15 @@ class BuildTests(SandboxCase):
     "bubblewrap with unprivileged user namespaces is required",
 )
 class LiveTests(SandboxCase):
-    def run_inside(self, script, *extra, env=None):
+    # "none" needs no slirp4netns or /dev/net/tun, so the general confinement tests run
+    # anywhere bwrap does; IsolatedNetworkTests covers the default "isolated" mode.
+    network = "none"
+
+    def run_inside(self, script, *extra, env=None, port=8787):
         cfg_file = self.home / ".config/keyveil/config.toml"
         cfg_file.write_text(
-            '[age]\nidentity = "%s"\nfile = "%s"\n'
-            % (self.home / "id.txt", self.home / "keys/env.age")
+            'port = %d\n[age]\nidentity = "%s"\nfile = "%s"\n'
+            % (port, self.home / "id.txt", self.home / "keys/env.age")
         )
         result = subprocess.run(
             [
@@ -180,6 +219,8 @@ class LiveTests(SandboxCase):
                 "sandbox",
                 "--project",
                 str(self.project),
+                "--network",
+                self.network,
                 *extra,
                 "--",
                 "bash",
@@ -265,27 +306,107 @@ class LiveTests(SandboxCase):
         self.assertEqual(out, {"creds": "", "sibling": "writable"})
         self.assertEqual(creds.read_text(), "OAUTH-TOKEN\n")  # untouched on the host
 
-    def test_loopback_reachable_processes_invisible_env_stripped(self):
+    def host_server(self, greeting=b""):
+        """A TCP server on the host's 127.0.0.1 that sends ``greeting`` to each client."""
         srv = socket.socket()
         srv.bind(("127.0.0.1", 0))
         srv.listen()
         self.addCleanup(srv.close)
-        port = srv.getsockname()[1]
-        threading.Thread(target=lambda: srv.accept()[0].close(), daemon=True).start()
+
+        def loop():
+            while True:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    return
+                conn.sendall(greeting)
+                conn.close()
+
+        threading.Thread(target=loop, daemon=True).start()
+        return srv.getsockname()[1]
+
+    def test_network_only_the_proxy_on_loopback(self):
+        # Audit regressions: the agent reached every host loopback service and the abstract
+        # socket of the X server (keystroke injection), and could squat the proxy's port.
+        proxy_port = self.host_server(b"proxy-hello")
+        other_port = self.host_server(b"other")
+        abstract = socket.socket(socket.AF_UNIX)
+        abstract.bind("\0keyveil-test-%d" % os.getpid())
+        abstract.listen()
+        self.addCleanup(abstract.close)
+        probe = (
+            "import socket\n"
+            "s = socket.socket(socket.AF_UNIX)\n"
+            "try:\n    s.connect('\\0keyveil-test-%d'); print('abstract=yes')\n"
+            "except OSError:\n    print('abstract=no')\n" % os.getpid()
+        )
+        out = self.run_inside(
+            'echo "proxy=$( (exec 3<>/dev/tcp/127.0.0.1/%d; head -c 11 <&3) 2>/dev/null)"\n'
+            'echo "other=$( (exec 3<>/dev/tcp/127.0.0.1/%d) 2>/dev/null && echo yes '
+            '|| echo no)"\n'
+            "python3 -c %s\n" % (proxy_port, other_port, shlex.quote(probe)),
+            port=proxy_port,
+        )
+        self.assertEqual(out, {"proxy": "proxy-hello", "other": "no", "abstract": "no"})
+
+    def test_processes_invisible_env_stripped(self):
         marker = subprocess.Popen(["sleep", "30"])
         self.addCleanup(marker.wait)
         self.addCleanup(marker.kill)
         out = self.run_inside(
-            'echo "loopback=$( (exec 3<>/dev/tcp/127.0.0.1/%d) 2>/dev/null && echo yes '
-            '|| echo no)"\n'
             'echo "seen=$([ -d /proc/%d ] && echo yes || echo no)"\n'
-            'echo "foo=${FOO_API_KEY-unset}"\necho "kept=${KEEP_TOKEN-unset}"\n'
-            % (port, marker.pid),
+            'echo "foo=${FOO_API_KEY-unset}"\necho "kept=${KEEP_TOKEN-unset}"\n' % marker.pid,
             "--keep-env",
             "KEEP_TOKEN",
             env={"FOO_API_KEY": "secret", "KEEP_TOKEN": "fine"},
         )
-        self.assertEqual(out, {"loopback": "yes", "seen": "no", "foo": "unset", "kept": "fine"})
+        self.assertEqual(out, {"seen": "no", "foo": "unset", "kept": "fine"})
+
+    def test_exit_status_is_the_agents(self):
+        cfg_file = self.home / ".config/keyveil/config.toml"
+        cfg_file.write_text("")
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "keyveil",
+                "sandbox",
+                "--project",
+                str(self.project),
+                "--network",
+                self.network,
+                "--",
+                "sh",
+                "-c",
+                "exit 7",
+            ],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 7, result.stderr)
+
+
+@unittest.skipUnless(
+    sys.platform.startswith("linux") and bwrap_works() and slirp_works(),
+    "slirp4netns and /dev/net/tun are required for the isolated network mode",
+)
+class IsolatedNetworkTests(LiveTests):
+    """The same live tests in the default mode, plus what only slirp4netns provides."""
+
+    network = "isolated"
+
+    def test_host_loopback_unreachable_through_slirp_gateway(self):
+        port = self.host_server(b"x")
+        out = self.run_inside(
+            'echo "gw=$( (exec 3<>/dev/tcp/10.0.2.2/%d) 2>/dev/null && echo yes '
+            '|| echo no)"\n'
+            # /proc is this namespace's own; /sys is the host's sysfs, bound in with /.
+            'echo "tap=$(grep -q "tap0:" /proc/net/dev && echo yes || echo no)"\n'
+            'echo "dns=$(cat /etc/resolv.conf)"\n' % port
+        )
+        self.assertEqual(out, {"gw": "no", "tap": "yes", "dns": "nameserver 10.0.2.3"})
 
 
 if __name__ == "__main__":

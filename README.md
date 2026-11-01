@@ -353,7 +353,7 @@ file or admin endpoints.
 - Something to decrypt your keys: [age] or [rage] (a passphrase, or a hardware key via
   [age-plugin-yubikey](https://github.com/str4d/age-plugin-yubikey)), or any command that
   prints `KEY=VALUE` lines — see [Other secret sources](#other-secret-sources)
-- Optional: `bubblewrap` for [`keyveil sandbox`](#confine-your-agents-keyveil-sandbox)
+- Optional: `bubblewrap` and `slirp4netns` for [`keyveil sandbox`](#confine-your-agents-keyveil-sandbox)
 
 ## Setup with a hardware key
 
@@ -639,9 +639,10 @@ everything else keeps working:
 | `sudo`, `su`, setuid programs | can't gain privileges (`no_new_privs`) |
 | Other processes (including keyveil) | invisible (own PID namespace) |
 | Environment variables that look like secrets | removed; the names are printed |
-| Network | shared: the internet and keyveil on `127.0.0.1` work |
+| Network | its own: the internet works (through `slirp4netns`), and keyveil is at the usual `127.0.0.1:<port>`; nothing else on your `127.0.0.1`, and no abstract Unix sockets (your X11 display, D-Bus, input methods). Services on your other addresses (e.g. your LAN IP) are still reachable |
 
-Options: `--project DIR`, `--rw PATH` / `--hide PATH` (or `[sandbox] rw = [...]`, `hide = [...]`
+Options: `--network isolated|none|host` (or `[sandbox] network = ...`; see below),
+`--project DIR`, `--rw PATH` / `--hide PATH` (or `[sandbox] rw = [...]`, `hide = [...]`
 in `config.toml`), `--keep-env NAME` (keep one variable the sandbox would otherwise remove), `--ssh-agent`,
 and `--dry-run` to print the exact `bwrap` command without running it. `--hide` also works on
 a single file inside a writable folder, e.g. `--hide ~/.claude/.credentials.json`. It refuses
@@ -660,8 +661,16 @@ It doesn't cover:
 - **Sending your project's files somewhere**: the agent has network access.
 - **Kernel exploits** that escape Linux namespaces.
 
-Requires `bwrap` (Ubuntu/Debian: `sudo apt install bubblewrap`) and unprivileged user
-namespaces (default on most distributions).
+**Network modes.** `isolated` (the default) gives the agent its own network namespace with
+internet access through `slirp4netns` and a relay to the keyveil proxy. `none` keeps only the
+relay: the agent can use keyveil but nothing else (no internet, so a Claude subscription login
+won't work). `host` shares your network as earlier versions did. Avoid it: the agent can then
+reach every service on your `127.0.0.1` and your X11 display, through which it can type into
+your other windows. A `--network host` session prints a warning.
+
+Requires `bwrap` and `slirp4netns` (Ubuntu/Debian: `sudo apt install bubblewrap slirp4netns`)
+and unprivileged user namespaces (default on most distributions). `--network none` doesn't
+need `slirp4netns`.
 
 ## Troubleshooting
 
@@ -680,6 +689,8 @@ namespaces (default on most distributions).
 | `403 forbidden: only local, non-browser clients` | The request came from a browser, or used an address other than `127.0.0.1:<port>` / `localhost:<port>` (including from inside a container) | Point your tool at exactly `http://127.0.0.1:8787` |
 | `403 path not allowed for this route` | The route has an `allow` list that doesn't include this request | Adjust the route's `allow` list |
 | `keyveil: bubblewrap is not installed` | `bwrap` is missing | `sudo apt install bubblewrap` |
+| `keyveil: slirp4netns is not installed` | The default `isolated` network mode needs it | `sudo apt install slirp4netns`, or use `--network none` (only the keyveil proxy, no internet) |
+| `keyveil: /dev/net/tun is missing` | You are inside a container or another sandbox without the tun device | Use `--network none` there, or run keyveil sandbox on the host |
 | `keyveil: bubblewrap cannot create a sandbox here` | Your system restricts unprivileged user namespaces (for example Ubuntu 24.04's AppArmor setting `kernel.apparmor_restrict_unprivileged_userns`; not tested by the author) | See your distribution's documentation for allowing `bwrap` |
 | `keyveil: refusing to make /home/you writable` | You started the sandbox from your home folder | `cd` into the project folder first |
 | `keyveil: refusing to make … writable …: it contains …` | A `--rw` path (or the project) would expose a hidden or protected path inside it | Pick a narrower directory, e.g. `~/.config/some-tool` instead of `~/.config` |
@@ -700,6 +711,8 @@ What keyveil protects, assuming an agent on your machine gets prompt-injected:
 | Agent edits what runs at your next unlock (config, PATH, shell rc, installed code) | n/a | exposed | **protected** |
 | A web page in your browser uses the proxy | n/a | **blocked** (Host/Origin check) | **blocked** |
 | Any local program spends your key while the proxy runs | exposed | limited (allowlists, idle shutdown) | limited |
+| Agent reaches your desktop (X11 keystroke injection), D-Bus or other local services | n/a | exposed | **protected** (own network namespace) |
+| Agent takes over the proxy's port to answer your other tools | n/a | exposed | **protected** for sandboxed agents; unsandboxed programs still can |
 
 Also worth doing, outside keyveil:
 - **Require a password for `sudo`** (remove `NOPASSWD` rules; edit with `sudo visudo`).
@@ -710,6 +723,9 @@ Also worth doing, outside keyveil:
 
 ## Limitations
 
+- **Anyone can listen on the proxy's port when keyveil isn't running.** A program running
+  as you (outside the sandbox) could bind `127.0.0.1:8787` after `keyveil stop` or an idle
+  shutdown and receive what your tools send: prompts and code, but never your keys.
 - **No client authentication.** Any local, non-browser program can make requests through the
   proxy while it is up — it just can't read the key. Stop it when you're not using it (or set
   `idle_timeout`), use `allow` lists for sensitive routes, and keep the default bind address of
