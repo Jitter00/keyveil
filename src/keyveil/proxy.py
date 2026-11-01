@@ -213,9 +213,17 @@ def main(argv=None):
             load_routes_file(args.routes)
         except (OSError, ValueError) as e:  # json.JSONDecodeError is a ValueError
             sys.exit("keyveil: bad routes file %s: %s" % (args.routes, e))
+    serve(sys.stdin.read(), args.host, port)
 
+
+def serve(env_text, host="127.0.0.1", port=8787):
+    """Harden the process, load keys from decrypted ``KEY=VALUE`` text, and serve forever.
+
+    Exits (SystemExit) if none of the configured routes has a key. Routes must already be
+    loaded into ROUTES. Used by ``python -m keyveil.proxy`` and by ``keyveil run``.
+    """
     harden()
-    env = parse_env(sys.stdin.read())
+    env = parse_env(env_text)
     load_keys(env)
     names = sorted(env)
     del env
@@ -224,11 +232,11 @@ def main(argv=None):
         sys.exit("keyveil: no usable keys on stdin. wanted=%s found_names=%s"
                  % (wanted, names))  # names only, never values
 
-    srv = ThreadingHTTPServer((args.host, port), Handler)
+    srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     sys.stderr.write("keyveil on %s:%d routes=%s\n"
-                     % (args.host, port, ",".join(sorted(KEYS))))
+                     % (host, port, ",".join(sorted(KEYS))))
     sys.stderr.flush()
     try:
         srv.serve_forever()

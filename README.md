@@ -122,8 +122,8 @@ author; if one doesn't work, please open an issue.
 ### Custom routes
 
 Add services without touching the code. Copy [`routes.example.json`](routes.example.json) to
-`routes.json` (gitignored; the launcher picks it up automatically, or pass `--routes FILE` /
-set `KEYVEIL_ROUTES`). The file holds only env var **names**, never secrets:
+`~/.config/keyveil/routes.json` (picked up automatically; or set `routes_file` in the config
+file). The file holds only env var **names**, never secrets:
 
 ```json
 {
@@ -141,19 +141,30 @@ crosses a network in clear. A bad routes file makes the proxy refuse to start, w
 
 ## Requirements
 
-- Linux (the hardening calls are Linux/glibc; elsewhere it still runs, just without them)
-- Python 3.10+ (standard library only — no dependencies)
+- **Linux.** The memory protections and process checks use Linux features (`/proc`, glibc);
+  macOS and Windows are not supported.
+- Python 3.11+ (standard library only, no dependencies). With [uv](https://docs.astral.sh/uv/)
+  you don't need to have it: uv downloads a suitable Python on first use.
 - Something to decrypt your keys: [age] or [rage] by default (for hardware-backed keys,
   [age-plugin-yubikey](https://github.com/str4d/age-plugin-yubikey)), or any command that prints
   `KEY=VALUE` lines — see [Other secret sources](#other-secret-sources)
-- Optional: [uv](https://docs.astral.sh/uv/) for development and installing the CLI
 
 ## Setup
 
-1. **Create an age identity** (a YubiKey-backed one is recommended — see the
+1. **Install** (from a clone of this repository for now):
+
+   ```bash
+   uv tool install .
+   ```
+
+   This puts a `keyveil` command on your PATH (run `uv tool update-shell` if `~/.local/bin`
+   isn't on it) and uses its own isolated environment. If your system Python is older than 3.11,
+   uv fetches a newer one by itself. With pipx instead: `pipx install --python python3.11 .`
+
+2. **Create an age identity** (a YubiKey-backed one is recommended — see the
    age-plugin-yubikey README), or a plain one with `rage-keygen`.
 
-2. **Encrypt your keys.** Copy [`.env.example`](.env.example) to `.env`, fill in the keys
+3. **Encrypt your keys.** Copy [`.env.example`](.env.example) to `.env`, fill in the keys
    you need, then encrypt and delete the plaintext:
 
    ```bash
@@ -162,38 +173,40 @@ crosses a network in clear. A bad routes file makes the proxy refuse to start, w
 
    Keep the variable names the routes expect (e.g. `ANTHROPIC_API_KEY`).
 
-3. **Tell the launcher where your identity is.** Copy `keyveil.conf.example` to
-   `keyveil.conf` (gitignored) and set `KEYVEIL_IDENTITY`. Other options
-   (`KEYVEIL_ENV_FILE`, `KEYVEIL_PORT`, `KEYVEIL_AGE`, `KEYVEIL_ROUTES`,
-   `KEYVEIL_DECRYPT_CMD`) are documented in the file. Not using age? Skip steps 1 and 2 and
-   see [Other secret sources](#other-secret-sources).
+4. **Create the config file.** `keyveil init` writes a commented starter to
+   `~/.config/keyveil/config.toml`. Set your age identity and the encrypted file:
 
-4. **Optional shell aliases** (adjust the path):
-
-   ```bash
-   alias veilup='~/path/to/keyveil/keyveil.sh start'
-   alias veildown='~/path/to/keyveil/keyveil.sh stop'
-   alias veilstatus='~/path/to/keyveil/keyveil.sh status'
+   ```toml
+   [age]
+   identity = "~/.config/age/identity.txt"
+   file = "~/.config/keyveil/env.age"
    ```
+
+   Other settings: `port` (default 8787), `routes_file`, and `[age] binary`. Not using age?
+   See [Other secret sources](#other-secret-sources). The file is plain TOML that keyveil reads
+   as data; it is never run as a script.
 
 ### Other secret sources
 
-keyveil itself never touches encryption: the proxy just reads `KEY=VALUE` lines on stdin. The
-launcher produces them by running a decrypt step, which is age by default but can be any shell
-command. Set `KEYVEIL_DECRYPT_CMD` in `keyveil.conf` (or the environment) to a command that
-prints the variables to stdout; it takes priority over the age settings:
+keyveil itself never touches encryption: the proxy just reads `KEY=VALUE` lines on stdin.
+`keyveil start` produces them by running a decrypt step, which is age by default but can be any
+command. Add a `[decrypt]` section to `config.toml` (or pass `--decrypt-cmd`) with a command
+that prints the variables to stdout; it takes priority over `[age]`:
 
-```bash
-KEYVEIL_DECRYPT_CMD='gpg -d "$HOME/keys.gpg"'
-KEYVEIL_DECRYPT_CMD='sops -d --output-type dotenv "$HOME/secrets.yaml"'
-KEYVEIL_DECRYPT_CMD='pass show keyveil'     # an entry holding KEY=VALUE lines
+```toml
+[decrypt]
+command = 'gpg -d "$HOME/keys.gpg"'
+# command = 'sops -d --output-type dotenv "$HOME/secrets.yaml"'
+# command = 'pass show keyveil'     # an entry holding KEY=VALUE lines
 # one secret per command: wrap it in the variable name the route expects
-KEYVEIL_DECRYPT_CMD='printf "ANTHROPIC_API_KEY=%s\n" "$(op read op://Private/Anthropic/credential)"'
-KEYVEIL_DECRYPT_CMD='printf "OPENAI_API_KEY=%s\n" "$(secret-tool lookup service openai)"'
+# command = 'printf "ANTHROPIC_API_KEY=%s\n" "$(op read op://Private/Anthropic/credential)"'
+# command = 'printf "OPENAI_API_KEY=%s\n" "$(secret-tool lookup service openai)"'
 ```
 
-Only age/rage has been tried by the author; the others are plausible examples, not tested
-recipes. By hand, without the launcher, it is the same idea: `<any command> | python3 -I src/keyveil/proxy.py`.
+The command runs with `/bin/sh`. Only its output is captured; stdin and stderr stay on your
+terminal, so hardware-key and passphrase prompts work. Only age/rage has been tried by the
+author; the others are plausible examples, not tested recipes. Without a config file, the same
+idea works by pipe: `<any command> | keyveil run --stdin`.
 
 Which source is best depends on what you are defending against. Roughly:
 
@@ -214,10 +227,13 @@ process's arguments (visible in `ps`).
 ## Usage
 
 ```bash
-./keyveil.sh start    # touch your YubiKey; prints "ok" when listening
-./keyveil.sh status
-./keyveil.sh stop     # also stops when you log out / reboot
+keyveil start     # touch your YubiKey; prints "ok" when listening
+keyveil status    # exit code 0 if running, 3 if not
+keyveil stop      # the keys vanish with the process; it does not survive a reboot
+keyveil run       # same as start, but in the foreground (Ctrl-C to stop)
 ```
+
+`--config FILE` and `--port N` work with every command (handy for a second instance).
 
 Check it (the credential you send is ignored and replaced):
 
@@ -227,10 +243,10 @@ curl -s http://127.0.0.1:8787/<route>/<path> -H 'Authorization: Bearer anything'
 curl -s http://127.0.0.1:8787/openai/v1/models -H 'Authorization: Bearer anything'
 ```
 
-Without the launcher, the same thing by hand:
+Without a config file, pipe the decrypted text in yourself:
 
 ```bash
-rage -d -i identity.txt .env.age | python3 -I src/keyveil/proxy.py --port 8787
+rage -d -i identity.txt .env.age | keyveil run --stdin --port 8787
 ```
 
 ### Point your tools at it
@@ -302,32 +318,41 @@ curl -s http://127.0.0.1:8787/netbox/api/dcim/sites/ -H 'Authorization: Token un
   request signing (e.g. AWS SigV4) and mutual TLS are not supported.
 - **HTTP(S) only.** No other protocols (SSH, database connections, …), and no WebSocket or
   HTTP/2 upstream features.
-- `keyveil.conf` is sourced as shell and `KEYVEIL_DECRYPT_CMD` is run with `eval`, so treat
-  both as code you trust and keep them writable only by you.
+- **Tampering.** A program running as you can't read the key from the proxy, but it could edit
+  what runs when you unlock: the config file (its `[decrypt] command` is run with `/bin/sh`),
+  the installed package, or your shell aliases and PATH. Your hardware-key touch authorizes
+  whatever is there at that moment. Keep those files writable only by you, and be suspicious of
+  a touch prompt you didn't trigger. Running untrusted agents as a different user or in a
+  container closes this gap.
 - `mlockall` needs a sufficient `ulimit -l`; if it fails it is silently skipped.
 - Prompts and responses pass through the proxy's memory but are never logged.
 - If decryption yields none of the expected variables, the proxy exits and logs the variable
-  **names** it found (never values) to `~/.cache/keyveil.log`.
+  **names** it found (never values) to `~/.local/state/keyveil/keyveil.log`.
 
 ## Development
 
 ```bash
-uv sync                                          # create the venv
-uv run python -m unittest discover -s tests -v   # offline tests (fake upstream, no real keys)
+uv sync                                          # create the venv (uv fetches Python 3.11+)
+uv run python -m unittest discover -s tests -v   # offline tests: no YubiKey, network or real keys
+uv run --python 3.11 python -m unittest discover -s tests   # also try the oldest supported Python
+./scripts/smoke-install.sh                       # build the wheel, install it, drive the real command
 uv run keyveil --help
-uv tool install .                                # optional: install the `keyveil` command
 ```
+
+The tests run `keyveil` in a sandbox with its own `HOME`, config and port, so they never touch
+your real setup or a running proxy.
 
 Layout:
 
 ```
+src/keyveil/cli.py       the `keyveil` command: init, start, stop, status, run
+src/keyveil/config.py    config file (TOML) loading and XDG paths
 src/keyveil/proxy.py     the proxy (self-contained, stdlib only)
-keyveil.sh               launcher: decrypt → pipe into the proxy; start/stop/status
-tests/test_proxy.py      offline tests for the proxy (fake upstream, no real keys)
-tests/test_launcher.py   launcher tests (stub decrypt commands, isolated from your config)
-.env.example             template for the file you encrypt
+tests/                   offline tests for the proxy, config and CLI
+scripts/smoke-install.sh packaging smoke test (builds and installs the wheel)
+config.example.toml      the config template (same as `keyveil init` writes)
 routes.example.json      template for custom routes
-keyveil.conf.example     launcher settings template
+.env.example             template for the file you encrypt
 ```
 
 ## License

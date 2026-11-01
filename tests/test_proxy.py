@@ -112,8 +112,9 @@ class ProxyTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        cls.proxy.shutdown()
-        cls.upstream.shutdown()
+        for srv in (cls.proxy, cls.upstream):
+            srv.shutdown()
+            srv.server_close()
         proxy.ROUTES.clear()
         proxy.ROUTES.update(cls._routes)
         proxy.KEYS.clear()

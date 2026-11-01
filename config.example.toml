@@ -1,0 +1,16 @@
+# keyveil configuration (TOML). Not secrets, just paths and settings.
+# Pick ONE way of getting your keys: [age] (default) or [decrypt].
+
+port = 8787
+# routes_file = "~/.config/keyveil/routes.json"   # extra routes; used automatically if it exists
+
+# 1) age / rage, e.g. an age-plugin-yubikey identity
+# [age]
+# identity = "~/.config/age/identity.txt"
+# file = "~/.config/keyveil/env.age"      # default
+# binary = "rage"                         # default: rage if installed, else age
+
+# 2) Anything else: a command that prints KEY=VALUE lines to stdout. It is run with /bin/sh,
+#    so treat it as code you trust. When set, [age] is ignored.
+# [decrypt]
+# command = 'gpg -d "$HOME/keys.gpg"'

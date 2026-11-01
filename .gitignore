@@ -3,7 +3,6 @@
 .env.*
 !.env.example
 *.age
-keyveil.conf
 
 # Python / uv
 __pycache__/

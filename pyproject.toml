@@ -1,11 +1,11 @@
 [project]
 name = "keyveil"
-version = "0.1.0"
+version = "0.2.0"
 description = "Localhost reverse proxy that injects API credentials held only in RAM into HTTP requests, so editors, agents and scripts never see or store them"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 dependencies = []  # standard library only, on purpose
 keywords = ["llm", "api-key", "credentials", "reverse-proxy", "secrets", "age", "yubikey", "ai-agents", "continue", "cline"]
 classifiers = [
@@ -16,7 +16,7 @@ classifiers = [
 ]
 
 [project.scripts]
-keyveil = "keyveil.proxy:main"
+keyveil = "keyveil.cli:main"
 
 [build-system]
 requires = ["hatchling"]
