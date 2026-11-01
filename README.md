@@ -1,8 +1,9 @@
 # keyveil
 
-A tiny localhost reverse proxy that adds your **API credentials to HTTP requests from
-memory**, so the tools making those requests — editors, coding agents, scripts, SDKs —
-never see, store, or inherit the real key.
+A tiny program that keeps your **cloud API keys** (OpenAI, Anthropic, DeepSeek, …) away from
+the tools that use them. Editors, coding agents and scripts talk to keyveil on your own
+computer with a fake key; keyveil swaps in the real key from memory and forwards the request.
+The tools never see, store, or inherit the real key.
 
 ```
   editor extensions ──┐                           ┌──▶ api.anthropic.com  (x-api-key)
@@ -12,15 +13,181 @@ never see, store, or inherit the real key.
                                      real keys: RAM only
 ```
 
-Keys stay encrypted at rest (by default an `.env.age` file decrypted with [age]/[rage],
-ideally with a hardware key such as a YubiKey; any other decrypt command works too, see
-[Other secret sources](#other-secret-sources)). They are decrypted once, piped straight into
-the proxy's stdin, and never touch the disk — not even `/run/user` or `/tmp`.
+Your keys stay encrypted on disk (a passphrase-protected file, or a hardware key such as a
+YubiKey). They are decrypted once when you start keyveil, passed straight into the program's
+memory, and never written to disk in plain text — not even to `/run/user` or `/tmp`.
 
-It was built to keep LLM provider keys away from AI coding tools, but nothing in it is
-provider-specific: it works for any HTTP API that authenticates with a key or token in a
-request header. Built-in routes cover a few common providers; anything else is a few lines in
-a JSON file.
+**Contents:** [Is this for you?](#is-this-for-you) ·
+[Quick start](#quick-start) · [Words used here](#words-used-here) ·
+[How it works](#how-it-works) · [Setup with a hardware key](#setup-with-a-hardware-key) ·
+[Usage](#usage) · [Point your tools at it](#point-your-tools-at-it) ·
+[Confine your agents](#confine-your-agents-keyveil-sandbox) ·
+[Troubleshooting](#troubleshooting) · [Threat model](#threat-model) ·
+[Limitations](#limitations) · [Development](#development)
+
+## Is this for you?
+
+keyveil protects **keys for cloud services**. Two cases:
+
+- **You only run models locally** (Ollama, llama.cpp, LM Studio, vLLM…) and they need no key:
+  there is nothing to protect, and you don't need keyveil. Tools talk to your local model
+  directly; keyveil only handles requests you point at it.
+- **You also use paid cloud APIs** from tools like Cline, Continue, Claude Code, Aider or your
+  own scripts, or you put a key in front of your own server (LiteLLM, vLLM behind auth…):
+  this is what keyveil is for. A tool that is tricked by a malicious web page, README or
+  dependency (a "prompt injection") can't leak a key it never had.
+
+It works on **Linux** (tested on Ubuntu 22.04). macOS and Windows are not supported.
+
+## Quick start
+
+About 10 minutes on Ubuntu or Debian. This path uses a **passphrase** you choose; no special
+hardware needed. (If you have a YubiKey, see [Setup with a hardware key](#setup-with-a-hardware-key)
+instead of steps 4–5.)
+
+**Terminal basics, if you need them:**
+- Open a terminal with <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>T</kbd>. Each grey box below is a
+  command: type or paste it, then press <kbd>Enter</kbd>. Lines starting with `#` are
+  comments; don't type them.
+- `~` means your home folder (like `/home/yourname`).
+- `sudo` asks for your password. Nothing appears on screen while you type it; that is normal.
+- To edit a text file, run `nano <file>`, type, press <kbd>Ctrl</kbd>+<kbd>O</kbd> then
+  <kbd>Enter</kbd> to save, and <kbd>Ctrl</kbd>+<kbd>X</kbd> to quit.
+
+**Step 1 — install `uv`** (a tool that installs Python programs; it also fetches the right
+Python version for you):
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
+
+Close the terminal and open a new one, then check it works: `uv --version`.
+
+**Step 2 — download and install keyveil** (needs `git`; if missing: `sudo apt install git`):
+
+```bash
+git clone <URL of this repository> keyveil
+cd keyveil
+uv tool install .
+keyveil --version
+```
+
+If it says `keyveil: command not found`, run `uv tool update-shell` and open a new terminal.
+To update later: `cd keyveil && git pull && uv tool install --force .`
+
+**Step 3 — install `age`** (the encryption tool):
+
+```bash
+sudo apt install age
+```
+
+**Step 4 — put your API keys in an encrypted file.** First write them in a temporary file in
+`/dev/shm`, a folder that lives in memory instead of on your disk:
+
+```bash
+nano /dev/shm/keys.env
+```
+
+Type one line per key, using **exactly** these names (keyveil recognises keys by name):
+
+| Service | Name to use |
+|---|---|
+| Anthropic | `ANTHROPIC_API_KEY` |
+| OpenAI | `OPENAI_API_KEY` |
+| DeepSeek | `DEEPSEEK_API_KEY` |
+
+```
+ANTHROPIC_API_KEY=sk-ant-paste-your-key-here
+OPENAI_API_KEY=sk-paste-your-key-here
+```
+
+Save and quit nano, then encrypt the file and delete the plain-text copy:
+
+```bash
+mkdir -p ~/.config/keyveil
+age -p -o ~/.config/keyveil/env.age /dev/shm/keys.env
+shred -u /dev/shm/keys.env
+```
+
+`age` asks for a passphrase twice (nothing shows while you type). **Pick a long one you will
+remember: without it the keys cannot be recovered.**
+
+**Step 5 — tell keyveil how to unlock the file.** Create its settings file and edit it:
+
+```bash
+keyveil init
+nano ~/.config/keyveil/config.toml
+```
+
+Add these two lines at the very end of the file, then save:
+
+```toml
+[decrypt]
+command = 'age -d "$HOME/.config/keyveil/env.age"'
+```
+
+**Step 6 — start it:**
+
+```bash
+keyveil start
+```
+
+Type your passphrase when asked. You should see `ok — keyveil on 127.0.0.1:8787`. It now runs
+in the background. (After a reboot, run `keyveil start` again.) Useful: `keyveil status`,
+`keyveil stop`.
+
+**Step 7 — point a tool at it.** For example Claude Code: add this to
+`~/.claude/settings.json` (create the file if needed; if it already has other settings, add
+just the `"env"` part):
+
+```json
+{ "env": { "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787/anthropic",
+           "ANTHROPIC_AUTH_TOKEN": "local-proxy" } }
+```
+
+`local-proxy` is a made-up placeholder, not a credential. Settings for Cline, Continue, Python
+scripts and others are in [Point your tools at it](#point-your-tools-at-it).
+
+**Step 8 (recommended) — run coding agents confined.** An agent running as you can do
+anything you can do. This runs it in a sandbox where it can edit your project and use
+keyveil, but can't read your SSH keys, use `sudo`, or change your shell settings
+([details](#confine-your-agents-keyveil-sandbox)):
+
+```bash
+sudo apt install bubblewrap
+cd ~/path/to/your/project
+keyveil sandbox -- claude
+```
+
+**Changing a key later:**
+
+```bash
+age -d -o /dev/shm/keys.env ~/.config/keyveil/env.age      # asks for your passphrase
+nano /dev/shm/keys.env                                      # edit, save, quit
+age -p -o ~/.config/keyveil/env.age.new /dev/shm/keys.env && mv ~/.config/keyveil/env.age.new ~/.config/keyveil/env.age
+shred -u /dev/shm/keys.env
+keyveil stop && keyveil start
+```
+
+A passphrase protects the file on disk. A hardware key is stronger, because it can't be
+copied and every unlock needs a physical touch. Use that if you have one.
+
+Something not working? See [Troubleshooting](#troubleshooting).
+
+## Words used here
+
+| Term | Meaning |
+|---|---|
+| **API key** | A secret password that lets a program use a paid service (e.g. your Anthropic account). Anyone who has it can spend your money. |
+| **Proxy** | A middleman program. Your tool sends its request to keyveil, and keyveil passes it on to the real service. |
+| **Dummy (placeholder) key** | A fake key like `local-proxy` that you give to your tools. keyveil ignores it and uses the real one. It is not a secret. |
+| **`127.0.0.1` / localhost** | "This computer". keyveil only listens there, so nothing on your network can reach it. |
+| **Port (`8787`)** | The "door number" keyveil listens on at `127.0.0.1`. Changeable in the settings file. |
+| **Route** | The first part of the address, e.g. `/anthropic/…`, which tells keyveil which service to forward to and which key to use. |
+| **Prompt injection** | Malicious instructions hidden in a web page, file or dependency that trick an AI agent into doing something you didn't intend. |
+| **Sandbox** | A restricted environment: the program runs on your computer but sees only what you allow. |
+| **age / passphrase** | `age` is a small encryption tool. A passphrase is a password you choose to lock the file with. |
+| **YubiKey** | A USB security key. The decryption key lives inside it and can't be copied out. |
 
 ## What is it good for?
 
@@ -61,10 +228,10 @@ At start, once (this is the only moment you unlock anything):
 
 ```
   encrypted file ──▶ decrypt command ──▶ KEY=VALUE text ──▶ keyveil process
-  (.env.age)         (age, gpg, sops…)   (a pipe, no file)   keeps keys in RAM
+  (env.age)          (age, gpg, sops…)   (a pipe, no file)   keeps keys in RAM
                             ▲
+                      passphrase, or
                       YubiKey touch
-                      or passphrase
 ```
 
 For every request afterwards:
@@ -129,7 +296,7 @@ author; if one doesn't work, please open an issue.
 
 Add services without touching the code. Copy [`routes.example.json`](routes.example.json) to
 `~/.config/keyveil/routes.json` (picked up automatically; or set `routes_file` in the config
-file). The file holds only env var **names**, never secrets:
+file), then restart keyveil. The file holds only env var **names**, never secrets:
 
 ```json
 {
@@ -140,7 +307,7 @@ file). The file holds only env var **names**, never secrets:
 }
 ```
 
-Put the matching variables (`NETBOX_TOKEN=…`) in the file you encrypt to `.env.age`. Then use
+Put the matching variables (`NETBOX_TOKEN=…`) in the file you encrypt. Then use
 `http://127.0.0.1:8787/netbox/api/…` with any dummy token. Upstreams must be `https://`;
 plain `http://` is accepted only for loopback (`localhost`, `127.0.0.1`), so a key never
 crosses a network in clear. A bad routes file (including a misspelled key) makes the proxy
@@ -162,39 +329,36 @@ file or admin endpoints.
 ## Requirements
 
 - **Linux.** The memory protections and process checks use Linux features (`/proc`, glibc);
-  macOS and Windows are not supported.
+  macOS and Windows are not supported. The author uses Ubuntu 22.04; other distributions are
+  untested.
 - Python 3.11+ (standard library only, no dependencies). With [uv](https://docs.astral.sh/uv/)
   you don't need to have it: uv downloads a suitable Python on first use.
-- Something to decrypt your keys: [age] or [rage] by default (for hardware-backed keys,
-  [age-plugin-yubikey](https://github.com/str4d/age-plugin-yubikey)), or any command that prints
-  `KEY=VALUE` lines — see [Other secret sources](#other-secret-sources)
+- Something to decrypt your keys: [age] or [rage] (a passphrase, or a hardware key via
+  [age-plugin-yubikey](https://github.com/str4d/age-plugin-yubikey)), or any command that
+  prints `KEY=VALUE` lines — see [Other secret sources](#other-secret-sources)
+- Optional: `bubblewrap` for [`keyveil sandbox`](#confine-your-agents-keyveil-sandbox)
 
-## Setup
+## Setup with a hardware key
 
-1. **Install** (from a clone of this repository for now):
+The Quick start uses a passphrase. With a hardware key (e.g. a YubiKey with
+[age-plugin-yubikey](https://github.com/str4d/age-plugin-yubikey)) the decryption key can't be
+copied off the device and every unlock needs a physical touch, which is the strongest option.
+Do Quick start steps 1–3 (install `uv`, keyveil, `age`/[rage]), then:
 
-   ```bash
-   uv tool install .
-   ```
+1. **Create an age identity on the key** (see the age-plugin-yubikey README), or a plain one
+   with `rage-keygen`. Note the *recipient* it prints (`age1…`).
 
-   This puts a `keyveil` command on your PATH (run `uv tool update-shell` if `~/.local/bin`
-   isn't on it) and uses its own isolated environment. If your system Python is older than 3.11,
-   uv fetches a newer one by itself. With pipx instead: `pipx install --python python3.11 .`
-
-2. **Create an age identity** (a YubiKey-backed one is recommended — see the
-   age-plugin-yubikey README), or a plain one with `rage-keygen`.
-
-3. **Encrypt your keys.** Copy [`.env.example`](.env.example) to `.env`, fill in the keys
-   you need, then encrypt and delete the plaintext:
+2. **Encrypt your keys** to that recipient. Write them in `/dev/shm/keys.env` as in Quick start
+   step 4 (use the exact variable names from the table there), then:
 
    ```bash
-   rage -r <your-age-recipient> -o .env.age .env && shred -u .env
+   mkdir -p ~/.config/keyveil
+   rage -r <your-age-recipient> -o ~/.config/keyveil/env.age /dev/shm/keys.env
+   shred -u /dev/shm/keys.env
    ```
 
-   Keep the variable names the routes expect (e.g. `ANTHROPIC_API_KEY`).
-
-4. **Create the config file.** `keyveil init` writes a commented starter to
-   `~/.config/keyveil/config.toml`. Set your age identity and the encrypted file:
+3. **Create the config file.** `keyveil init` writes a commented starter to
+   `~/.config/keyveil/config.toml`. Add your identity file and the encrypted file:
 
    ```toml
    [age]
@@ -202,9 +366,10 @@ file or admin endpoints.
    file = "~/.config/keyveil/env.age"
    ```
 
-   Other settings: `port` (default 8787), `routes_file`, and `[age] binary`. Not using age?
-   See [Other secret sources](#other-secret-sources). The file is plain TOML that keyveil reads
-   as data; it is never run as a script.
+   Other settings: `port` (default 8787), `routes_file`, `idle_timeout`, and `[age] binary`.
+   The file is plain TOML that keyveil reads as data; it is never run as a script.
+
+4. `keyveil start`, and touch the key when it blinks.
 
 ### Other secret sources
 
@@ -215,7 +380,8 @@ that prints the variables to stdout; it takes priority over `[age]`:
 
 ```toml
 [decrypt]
-command = 'gpg -d "$HOME/keys.gpg"'
+command = 'age -d "$HOME/.config/keyveil/env.age"'      # passphrase (the Quick start)
+# command = 'gpg -d "$HOME/keys.gpg"'
 # command = 'sops -d --output-type dotenv "$HOME/secrets.yaml"'
 # command = 'pass show keyveil'     # an entry holding KEY=VALUE lines
 # one secret per command: wrap it in the variable name the route expects
@@ -224,15 +390,16 @@ command = 'gpg -d "$HOME/keys.gpg"'
 ```
 
 The command runs with `/bin/sh`. Only its output is captured; stdin and stderr stay on your
-terminal, so hardware-key and passphrase prompts work. Only age/rage has been tried by the
-author; the others are plausible examples, not tested recipes. Without a config file, the same
-idea works by pipe: `<any command> | keyveil run --stdin`.
+terminal, so hardware-key and passphrase prompts work. The author has tried age with a
+passphrase and rage with a YubiKey; the others are plausible examples, not tested recipes.
+Without a config file, the same idea works by pipe: `<any command> | keyveil run --stdin`.
 
 Which source is best depends on what you are defending against. Roughly:
 
 | Source | Good for | Watch out for |
 |---|---|---|
-| **age + hardware key** (default) | Solo use; touch per unlock | You manage the identity and the file |
+| **age + hardware key** | Solo use; touch per unlock | You manage the identity and the file |
+| **age + passphrase** | Simple, no hardware | Only as strong as the passphrase |
 | **gpg** (smartcard) | You already use it | `gpg-agent` may cache the unlock, so a program can decrypt without a prompt |
 | **sops** | Teams, secrets in git | A wrapper over age/gpg/KMS; output must be dotenv |
 | **TPM / `systemd-creds`** | Servers, unattended boot | Tied to the machine, no touch step |
@@ -247,7 +414,7 @@ process's arguments (visible in `ps`).
 ## Usage
 
 ```bash
-keyveil start     # touch your YubiKey; prints "ok" when listening
+keyveil start     # unlock (passphrase or key touch); prints "ok" when listening
 keyveil status    # exit code 0 if running, 3 if not
 keyveil stop      # the keys vanish with the process; it does not survive a reboot
 keyveil run       # same as start, but in the foreground (Ctrl-C to stop)
@@ -269,15 +436,25 @@ curl -s http://127.0.0.1:8787/openai/v1/models -H 'Authorization: Bearer anythin
 Without a config file, pipe the decrypted text in yourself:
 
 ```bash
-rage -d -i identity.txt .env.age | keyveil run --stdin --port 8787
+rage -d -i identity.txt env.age | keyveil run --stdin --port 8787
 ```
+
+**Where things live:**
+
+| What | Where |
+|---|---|
+| Settings | `~/.config/keyveil/config.toml` |
+| Your encrypted keys (Quick start) | `~/.config/keyveil/env.age` |
+| Extra routes (optional) | `~/.config/keyveil/routes.json` |
+| Log (never contains keys or prompts) | `~/.local/state/keyveil/keyveil.log` |
+| "Is it running" marker (just a process number) | `/run/user/<your id>/keyveil/<port>.pid` |
 
 ### Point your tools at it
 
 Use any non-empty dummy key (e.g. `local-proxy`) — it is not a credential. The pattern is always
 the same: base URL `http://127.0.0.1:8787/<route>/…`, dummy key.
 
-**Claude Code** (needs `ANTHROPIC_API_KEY` in `.env.age`; keep that name there — the dummy
+**Claude Code** (needs `ANTHROPIC_API_KEY` in the encrypted file; keep that name there — the dummy
 below is only a client-side placeholder). In `~/.claude/settings.json`:
 
 ```json
@@ -332,7 +509,7 @@ curl -s http://127.0.0.1:8787/netbox/api/dcim/sites/ -H 'Authorization: Token un
 
 Editors and agents run as **you**. If an agent is tricked by a prompt injection (a malicious
 README, issue, web page or dependency), it can do anything you can: edit `~/.bashrc` or the
-code your next YubiKey touch unlocks, use `sudo` if it doesn't need a password, or use Docker
+code your next unlock runs, use `sudo` if it doesn't need a password, or use Docker
 (membership in the `docker`, `lxd` or `libvirt` groups is root-equivalent). Root can read
 any process's memory, including keyveil's.
 
@@ -340,10 +517,54 @@ any process's memory, including keyveil's.
 (the sandbox Flatpak uses; no root or Docker needed) so those paths are closed while
 everything else keeps working:
 
-```bash
-cd ~/projects/my-app
-keyveil sandbox -- claude
 ```
+  Normal terminal                                  Sandbox: keyveil sandbox -- claude
+  ┌───────────────────────────────┐                ┌────────────────────────────────┐
+  │ keyveil: holds the real keys  │                │ the agent (claude, aider, …)   │
+  │ your SSH keys and passwords   │◀───────────────│ can edit:  the project folder  │
+  │ sudo, Docker                  │  127.0.0.1     │ can use:   keyveil, internet   │
+  │ your shell settings           │     :8787      │ can't see: keys, SSH, sudo,    │
+  └───────────────────────────────┘                │            Docker, shell setup │
+                                                   └────────────────────────────────┘
+```
+
+### How to use it
+
+1. Start keyveil in a **normal** terminal: `keyveil start`.
+2. Go into the folder of the project you want the agent to work on, then start the agent
+   through the sandbox:
+
+   ```bash
+   cd ~/projects/my-app
+   keyveil sandbox -- claude
+   ```
+
+   Everything after the `--` is the command to run, with its own options if it has any
+   (`keyveil sandbox -- claude --resume`). Any agent works: `aider`, `codex`, a shell
+   (`keyveil sandbox -- bash`) to look around.
+3. To check you are inside, run `touch ~/.bashrc` in the agent's terminal. Inside the
+   sandbox it fails with "Read-only file system"; outside, it succeeds silently.
+
+### Rules of thumb
+
+- **Start every agent session this way.** An agent started the normal way is not confined.
+- **Run `keyveil start`, `stop` and `status` in a normal terminal.** Inside the sandbox
+  keyveil's own files are hidden on purpose, so the command isn't available there.
+- **Start it from inside the project folder**, never from your home folder (keyveil refuses).
+  The agent can change everything in that folder, so keep secrets out of it.
+- **Anything outside the project is read-only** for the agent: it can't edit other projects,
+  `~/.bashrc` or installed programs, and global installs (`pip install --user`, `npm -g`)
+  fail. Use a project-local virtual environment instead.
+- **`sudo` and Docker don't work inside.** Run those yourself in a normal terminal.
+- **Tool caches start empty** (`~/.cache` is private), so the first run may re-download
+  things. To keep one, allow it: `keyveil sandbox --rw ~/.cache/pip -- claude`.
+- **`git push` over SSH is blocked** because your SSH keys are hidden. Either push from a
+  normal terminal, or add `--ssh-agent` for that session (it lets the agent use your SSH
+  identities, so only do it when you need it).
+- **Secret-looking environment variables are removed** (`*_API_KEY`, `*_TOKEN`, `AWS_*`, …);
+  the names are printed when it starts. If a tool really needs one, add `--keep-env NAME`.
+
+### What is inside and what isn't
 
 | Inside the sandbox | |
 |---|---|
@@ -354,14 +575,13 @@ keyveil sandbox -- claude
 | `~/.ssh`, `~/.gnupg`, cloud CLI credentials, browser profiles, shell history, keyveil's config, your encrypted key file and identity | hidden |
 | `sudo`, `su`, setuid programs | can't gain privileges (`no_new_privs`) |
 | Other processes (including keyveil) | invisible (own PID namespace) |
-| Environment variables that look like secrets (`*_API_KEY`, `*_TOKEN`, `AWS_*`, …) | removed; the names are printed |
+| Environment variables that look like secrets | removed; the names are printed |
 | Network | shared: the internet and keyveil on `127.0.0.1` work |
 
 Options: `--project DIR`, `--rw PATH` / `--hide PATH` (or `[sandbox] rw = [...]`, `hide = [...]`
 in `config.toml`), `--keep-env NAME` (e.g. if you pass `ANTHROPIC_AUTH_TOKEN=local-proxy` in the
-environment instead of `settings.json`), `--ssh-agent` (allow `git push` over ssh), and
-`--dry-run` to print the exact `bwrap` command. It refuses to make your whole home directory
-writable.
+environment instead of `settings.json`), `--ssh-agent`, and `--dry-run` to print the exact
+`bwrap` command without running it. It refuses to make your whole home directory writable.
 
 It doesn't cover:
 - **Editor extensions** (Cline, Continue…): they run inside the editor's own process, so
@@ -374,6 +594,29 @@ It doesn't cover:
 
 Requires `bwrap` (Ubuntu/Debian: `sudo apt install bubblewrap`) and unprivileged user
 namespaces (default on most distributions).
+
+## Troubleshooting
+
+| What you see | Why | What to do |
+|---|---|---|
+| `keyveil: command not found` | The terminal doesn't know where `uv` installed it, or you are inside the sandbox (where it is hidden on purpose) | Run `uv tool update-shell` and open a new terminal. In the sandbox, use a normal terminal for keyveil commands |
+| A tool says "connection refused" | keyveil isn't running (it doesn't survive a reboot) | `keyveil status`, then `keyveil start` |
+| `keyveil: port 8787 is already in use by another process` | Another program uses that port | Set a different `port = 8788` in `config.toml` (and in your tools' base URL), or stop the other program |
+| `keyveil: decryption failed` | Wrong passphrase, wrong identity file, or the YubiKey wasn't touched in time | Run `keyveil start` again and retry |
+| `keyveil: no key source configured` | `config.toml` has neither a `[decrypt]` nor an `[age]` section | Quick start step 5 |
+| `keyveil: encrypted file not found` | The `[age] file` path is wrong | Fix the path in `config.toml` |
+| `keyveil: failed to start: no usable keys on stdin. wanted=[…] found_names=[…]` | The names in your encrypted file don't match what the routes expect (it prints the names it found, never the values) | Use the exact names from the [table](#how-it-works), e.g. `ANTHROPIC_API_KEY`; see "Changing a key later" |
+| The provider says "invalid API key" (401) | The key inside your encrypted file is wrong or expired | "Changing a key later" in the Quick start |
+| `404 unknown route` | The first part of the address isn't a route, or that route's key isn't in the file | Check the spelling (`/anthropic/…`) and that its variable is in the file |
+| `403 forbidden: only local, non-browser clients` | The request came from a browser, or used an address other than `127.0.0.1:<port>` / `localhost:<port>` (including from inside a container) | Point your tool at exactly `http://127.0.0.1:8787` |
+| `403 path not allowed for this route` | The route has an `allow` list that doesn't include this request | Adjust the route's `allow` list |
+| `keyveil: bubblewrap is not installed` | `bwrap` is missing | `sudo apt install bubblewrap` |
+| `keyveil: bubblewrap cannot create a sandbox here` | Your system restricts unprivileged user namespaces (for example Ubuntu 24.04's AppArmor setting `kernel.apparmor_restrict_unprivileged_userns`; not tested by the author) | See your distribution's documentation for allowing `bwrap` |
+| `keyveil: refusing to make /home/you writable` | You started the sandbox from your home folder | `cd` into the project folder first |
+| A tool inside the sandbox can't find a file | That folder is hidden or read-only | Allow it with `--rw PATH` (writable) — see [Rules of thumb](#rules-of-thumb) |
+
+The log (`~/.local/state/keyveil/keyveil.log`) shows each request's method, path and status,
+which helps tell "keyveil refused it" (403/404) from "the provider refused it" (401/429).
 
 ## Threat model
 
@@ -402,15 +645,15 @@ Also worth doing, outside keyveil:
   `idle_timeout`), use `allow` lists for sensitive routes, and keep the default bind address of
   `127.0.0.1`.
 - It does **not** protect against root (unless agents are sandboxed), a compromised kernel, or
-  someone who can already use your unlocked YubiKey.
+  someone who can already use your unlocked key or know your passphrase.
 - **Header credentials only.** Keys in the URL/query string, OAuth flows with token refresh,
   request signing (e.g. AWS SigV4) and mutual TLS are not supported.
 - **HTTP(S) only.** No other protocols (SSH, database connections, …), and no WebSocket or
   HTTP/2 upstream features.
 - **Tampering.** Outside the sandbox, a program running as you could edit what runs when you
   unlock: the config file (its `[decrypt] command` is run with `/bin/sh`), the installed
-  package, or your shell aliases and PATH. Your hardware-key touch authorizes whatever is there
-  at that moment, so be suspicious of a touch prompt you didn't trigger.
+  package, or your shell aliases and PATH. Your passphrase or key touch authorizes whatever is
+  there at that moment, so be suspicious of an unlock prompt you didn't trigger.
 - `mlockall` needs a sufficient `ulimit -l`; if it fails it is silently skipped.
 - Prompts and responses pass through the proxy's memory but are never logged.
 - If decryption yields none of the expected variables, the proxy exits and logs the variable
