@@ -35,7 +35,7 @@ a JSON file.
 - **Shared or recorded machines** (screen sharing, demos, pairing): nothing sensitive in
   environment variables or dotfiles to leak.
 
-It is **not** a fit for anything that is not plain HTTP with a static header credential; see
+It is **not** a fit for anything that is not an HTTP(S) API with a static header credential; see
 [Limitations](#security-notes-and-limitations).
 
 ## Why not just export the env var and launch the tool?
