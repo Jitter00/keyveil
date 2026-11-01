@@ -645,7 +645,10 @@ Options: `--project DIR`, `--rw PATH` / `--hide PATH` (or `[sandbox] rw = [...]`
 in `config.toml`), `--keep-env NAME` (keep one variable the sandbox would otherwise remove), `--ssh-agent`,
 and `--dry-run` to print the exact `bwrap` command without running it. `--hide` also works on
 a single file inside a writable folder, e.g. `--hide ~/.claude/.credentials.json`. It refuses
-to make your whole home directory writable. Shortcuts for Claude Code are in
+to make anything writable (the project or a `--rw` path) that is your home directory, contains
+a hidden path or keyveil's own files, or contains files that run code later outside the
+sandbox (`~/.bashrc`, `~/.local/bin`, `~/.config/systemd`, …): e.g. `--rw ~/.config` is
+refused, `--rw ~/.config/some-tool` is fine. Shortcuts for Claude Code are in
 [Claude Code: subscription or API key](#claude-code-subscription-or-api-key).
 
 It doesn't cover:
@@ -679,6 +682,7 @@ namespaces (default on most distributions).
 | `keyveil: bubblewrap is not installed` | `bwrap` is missing | `sudo apt install bubblewrap` |
 | `keyveil: bubblewrap cannot create a sandbox here` | Your system restricts unprivileged user namespaces (for example Ubuntu 24.04's AppArmor setting `kernel.apparmor_restrict_unprivileged_userns`; not tested by the author) | See your distribution's documentation for allowing `bwrap` |
 | `keyveil: refusing to make /home/you writable` | You started the sandbox from your home folder | `cd` into the project folder first |
+| `keyveil: refusing to make … writable …: it contains …` | A `--rw` path (or the project) would expose a hidden or protected path inside it | Pick a narrower directory, e.g. `~/.config/some-tool` instead of `~/.config` |
 | A tool inside the sandbox can't find a file | That folder is hidden or read-only | Allow it with `--rw PATH` (writable) — see [Rules of thumb](#rules-of-thumb) |
 
 The log (`~/.local/state/keyveil/keyveil.log`) shows each request's method, path and status,

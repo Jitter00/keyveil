@@ -2,6 +2,7 @@
 script inside a real sandbox with a throwaway HOME (created inside the repo, not under /tmp,
 because the sandbox replaces /tmp and that would make "hidden" checks pass trivially)."""
 
+import dataclasses
 import os
 import shutil
 import socket
@@ -11,6 +12,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from keyveil import config, proxy, sandbox
 
@@ -75,6 +77,48 @@ class BuildTests(SandboxCase):
             self.build(project=self.home / "missing")
         with self.assertRaises(sandbox.SandboxError):
             self.build(command=())
+
+    @mock.patch.dict(os.environ)
+    def test_refuses_writable_paths_that_would_expose_protected_ones(self):
+        os.environ["XDG_CONFIG_HOME"] = str(self.home / ".config")
+        (self.home / ".config/git").mkdir(parents=True)
+        (self.project / "keys").mkdir()
+        for bad in (
+            self.home,  # $HOME itself: ~/.bashrc, ~/.ssh, ...
+            self.root,  # a parent of $HOME
+            self.home / ".config",  # contains keyveil's config and ~/.config/git
+            self.home / ".config/keyveil",  # keyveil's config itself (even if it existed)
+            self.home / ".ssh/sub",  # inside a hidden directory
+            self.home / ".local",  # contains ~/.local/bin (on PATH)
+            self.home / "keys",  # contains the encrypted key file
+        ):
+            with self.assertRaises(sandbox.SandboxError, msg=bad):
+                self.build(extra_rw=[str(bad)])
+            with self.assertRaises(sandbox.SandboxError, msg=bad):
+                self.build(cfg=dataclasses.replace(self.cfg, sandbox_rw=(bad,)))
+        # The key file inside the project would make the project unsafe too.
+        cfg = dataclasses.replace(self.cfg, age_file=self.project / "keys/env.age")
+        with self.assertRaises(sandbox.SandboxError):
+            self.build(cfg=cfg)
+        # A harmless sibling is fine.
+        (self.home / "cache-dir").mkdir()
+        self.build(extra_rw=[str(self.home / "cache-dir")])
+
+    def test_every_hide_comes_after_every_writable_bind(self):
+        (self.home / "cache-dir").mkdir()
+        argv, _, _ = self.build(extra_rw=[str(self.home / "cache-dir")], extra_hide=["/etc"])
+        binds = [i for i, a in enumerate(argv) if a == "--bind"]
+        hides = [
+            i
+            for i, a in enumerate(argv)
+            if (a == "--tmpfs" and argv[i + 1] not in ("/run", "/tmp", str(self.home / ".cache")))
+            or (a == "--ro-bind" and argv[i + 1] == "/dev/null")
+        ]
+        self.assertTrue(binds and hides)
+        self.assertLess(max(binds), min(hides))
+        hidden = {argv[i + 1] if argv[i] == "--tmpfs" else argv[i + 2] for i in hides}
+        for path in (self.home / ".ssh", self.home / "keys/env.age", self.home / "id.txt"):
+            self.assertIn(str(path), hidden)
 
     def test_secret_environment_is_removed_and_reported(self):
         env = {
@@ -181,6 +225,29 @@ class LiveTests(SandboxCase):
         self.assertEqual((self.project / "made-inside").read_text(), "ok\n")
         self.assertFalse((self.project / ".git/hooks/pre-commit").exists())
         self.assertTrue((self.home / ".claude/new").exists())
+
+    def test_refuses_a_writable_parent_of_keyveil_config(self):
+        # Audit regression: --rw ~/.config used to re-expose ~/.config/keyveil read-write.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "keyveil",
+                "sandbox",
+                "--project",
+                str(self.project),
+                "--rw",
+                str(self.home / ".config"),
+                "--",
+                "true",
+            ],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("refusing to make", result.stderr)
 
     def test_hide_works_for_a_file_inside_a_writable_directory(self):
         # e.g. `--hide ~/.claude/.credentials.json` while ~/.claude itself is writable.

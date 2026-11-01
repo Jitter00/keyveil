@@ -48,6 +48,23 @@ HIDDEN_IN_HOME = (
 )
 # Writable for the agent if they exist (relative to $HOME): Claude Code's state.
 AGENT_STATE = (".claude", ".claude.json")
+# Run code later, outside the sandbox (relative to $HOME). Read-only like the rest of $HOME;
+# listed so that no writable path (--rw, the project) can contain them.
+RUNS_CODE_LATER = (
+    ".bashrc",
+    ".bash_profile",
+    ".bash_logout",
+    ".profile",
+    ".zshrc",
+    ".zprofile",
+    ".zshenv",
+    ".gitconfig",
+    ".config/git",
+    ".config/autostart",
+    ".config/systemd",
+    ".config/environment.d",
+    ".local/bin",
+)
 # Environment variables removed before the agent starts (fnmatch, case-sensitive).
 SECRET_ENV = (
     "*_API_KEY",
@@ -80,6 +97,32 @@ def _secret_env_names(environ, route_env_names, keep):
     return sorted(names)
 
 
+def _check_writable(path, home, protected, what):
+    """Raise SandboxError unless ``path`` is safe to make writable for the agent.
+
+    Refused: /, $HOME and its parents, and anything that contains or sits inside a
+    protected path (whether or not that path exists yet: the agent could create it).
+    """
+    path = Path(path).resolve()
+    if path == home or path in home.parents:
+        raise SandboxError(
+            "refusing to make %s writable: pick a directory below your home directory" % path
+        )
+    for p in protected:
+        p = Path(p).expanduser().resolve()
+        if path == p or path in p.parents or p in path.parents:
+            raise SandboxError(
+                "refusing to make %s writable (%s): it %s %s, which must stay protected. "
+                "Pick a narrower directory."
+                % (
+                    path,
+                    what,
+                    "is" if path == p else "is inside" if p in path.parents else "contains",
+                    p,
+                )
+            )
+
+
 def _tiocsti_possible():
     """True unless the kernel blocks terminal keystroke injection (dev.tty.legacy_tiocsti=0)."""
     try:
@@ -109,12 +152,6 @@ def build(
     project = Path(project).resolve()
     if not project.is_dir():
         raise SandboxError("project directory not found: %s" % project)
-    if project == home or project in home.parents or project == Path("/"):
-        raise SandboxError(
-            "refusing to make %s writable: pick a project directory below your "
-            "home directory" % project
-        )
-
     warnings = []
     argv = [
         "bwrap",
@@ -148,32 +185,30 @@ def build(
             "in a new session (some terminal features may not work)"
         )
 
-    def hide(path):
-        path = Path(path)
-        if path.is_dir() and not path.is_symlink():
-            argv.extend(["--tmpfs", str(path)])
-        elif path.exists():
-            argv.extend(["--ro-bind", "/dev/null", str(path)])
+    # What gets hidden: common secret stores, then keyveil itself (config, log/state, the
+    # installed environment, and the key files).
+    hidden = [home / rel for rel in HIDDEN_IN_HOME]
+    hidden += [cfgmod.config_dir(), cfgmod.state_dir()]
+    prefix = Path(prefix or sys.prefix).resolve()
+    if home in prefix.parents and prefix != project and project not in prefix.parents:
+        hidden.append(prefix)  # e.g. ~/.local/share/uv/tools/keyveil
+    hidden += [p for p in (cfg.age_file, cfg.age_identity) if p]
+
+    # Nothing writable may contain, or sit inside, a hidden path or a file that runs code
+    # later outside the sandbox: a writable parent would let the agent replace it.
+    protected = [*hidden, *(home / rel for rel in RUNS_CODE_LATER)]
+    _check_writable(project, home, protected, what="project directory")
+    user_rw = [Path(p).expanduser() for p in (*cfg.sandbox_rw, *extra_rw)]
+    for path in user_rw:
+        _check_writable(path, home, protected, what="writable path")
 
     if (home / ".cache").is_dir():
         argv += ["--tmpfs", str(home / ".cache")]  # private scratch; nothing persists
-    for rel in HIDDEN_IN_HOME:
-        hide(home / rel)
-    # keyveil itself: config, log/state, the installed environment, and the key files.
-    for path in (cfgmod.config_dir(), cfgmod.state_dir()):
-        hide(path)
-    prefix = Path(prefix or sys.prefix).resolve()
-    if home in prefix.parents and prefix != project and project not in prefix.parents:
-        hide(prefix)  # e.g. ~/.local/share/uv/tools/keyveil
-    for path in (cfg.age_file, cfg.age_identity):
-        if path:
-            hide(path)
 
-    for path in (*(home / rel for rel in AGENT_STATE), *cfg.sandbox_rw, *extra_rw):
-        path = Path(path).expanduser()
+    for path in (*(home / rel for rel in AGENT_STATE), *user_rw):
         if path.exists():
             argv += ["--bind", str(path), str(path)]
-        elif path in cfg.sandbox_rw or path in [Path(p).expanduser() for p in extra_rw]:
+        elif path in user_rw:
             warnings.append("writable path does not exist, skipped: %s" % path)
 
     argv += ["--bind", str(project), str(project)]
@@ -183,10 +218,15 @@ def build(
             if (git / rel).exists():
                 argv += ["--ro-bind", str(git / rel), str(git / rel)]
 
-    # User-requested hides go last: a later mount covers an earlier one, so hiding a file
-    # inside a writable path (e.g. ~/.claude/.credentials.json) only works after the binds.
-    for path in (*cfg.sandbox_hide, *extra_hide):
-        hide(Path(path).expanduser())
+    # Every hide goes after every bind: a later mount covers an earlier one, so this is what
+    # keeps a hidden path hidden even inside a writable directory (including user hides of a
+    # single file such as ~/.claude/.credentials.json).
+    for path in (*hidden, *(Path(p).expanduser() for p in (*cfg.sandbox_hide, *extra_hide))):
+        path = Path(path)
+        if path.is_dir() and not path.is_symlink():
+            argv.extend(["--tmpfs", str(path)])
+        elif path.exists():
+            argv.extend(["--ro-bind", "/dev/null", str(path)])
 
     if ssh_agent:
         sock = environ.get("SSH_AUTH_SOCK")
