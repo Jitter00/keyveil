@@ -1,4 +1,5 @@
 """Config loading: defaults, XDG paths, precedence, and clear errors. No real files touched."""
+
 import os
 import shutil
 import tempfile
@@ -14,8 +15,12 @@ class ConfigTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
-        env = {"HOME": str(self.tmp), "XDG_CONFIG_HOME": str(self.tmp / "cfg"),
-               "XDG_STATE_HOME": str(self.tmp / "state"), "XDG_RUNTIME_DIR": str(self.tmp / "run")}
+        env = {
+            "HOME": str(self.tmp),
+            "XDG_CONFIG_HOME": str(self.tmp / "cfg"),
+            "XDG_STATE_HOME": str(self.tmp / "state"),
+            "XDG_RUNTIME_DIR": str(self.tmp / "run"),
+        }
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -82,14 +87,21 @@ command = "echo hi"
         self.assertIn("line 2", str(cm.exception))
 
     def test_unknown_keys_are_rejected_so_typos_are_not_silent(self):
-        for text in ('prot = 1\n', '[age]\nidentiy = "x"\n', '[decrypt]\ncmd = "x"\n'):
+        for text in ("prot = 1\n", '[age]\nidentiy = "x"\n', '[decrypt]\ncmd = "x"\n'):
             with self.assertRaises(config.ConfigError, msg=text) as cm:
                 config.load(self.write(text))
             self.assertIn("unknown key", str(cm.exception))
 
     def test_wrong_types_and_bad_ports(self):
-        bad = ['port = "8787"\n', 'port = true\n', 'port = 0\n', 'port = 70000\n',
-               'age = 3\n', '[age]\nidentity = ""\n', '[decrypt]\ncommand = 5\n']
+        bad = [
+            'port = "8787"\n',
+            "port = true\n",
+            "port = 0\n",
+            "port = 70000\n",
+            "age = 3\n",
+            '[age]\nidentity = ""\n',
+            "[decrypt]\ncommand = 5\n",
+        ]
         for text in bad:
             with self.assertRaises(config.ConfigError, msg=text):
                 config.load(self.write(text))
@@ -109,8 +121,13 @@ command = "echo hi"
         self.assertEqual(cfg.sandbox_rw, (self.tmp / "a",))
         self.assertEqual(cfg.sandbox_hide, (self.tmp / "b", Path("/c")))
         self.assertEqual(config.load().sandbox_rw, ())
-        for bad in ('[sandbox]\nrw = "~/a"\n', '[sandbox]\nhide = [1]\n', '[sandbox]\nhide = [""]\n',
-                    '[sandbox]\nwritable = []\n', 'sandbox = 1\n'):
+        for bad in (
+            '[sandbox]\nrw = "~/a"\n',
+            "[sandbox]\nhide = [1]\n",
+            '[sandbox]\nhide = [""]\n',
+            "[sandbox]\nwritable = []\n",
+            "sandbox = 1\n",
+        ):
             with self.assertRaises(config.ConfigError, msg=bad):
                 config.load(self.write(bad))
 

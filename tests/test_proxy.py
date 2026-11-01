@@ -1,4 +1,5 @@
 """Offline tests: the proxy is pointed at a local fake upstream (no network, no real keys)."""
+
 import json
 import os
 import tempfile
@@ -40,7 +41,7 @@ def serve(handler):
 class ParseEnvTests(unittest.TestCase):
     def test_formats(self):
         env = proxy.parse_env(
-            '# comment\n\nA=1\nexport B="two words"\nC=\'x\'\r\nD = spaced \nnoequals\nE=a=b\n'
+            "# comment\n\nA=1\nexport B=\"two words\"\nC='x'\r\nD = spaced \nnoequals\nE=a=b\n"
         )
         self.assertEqual(env, {"A": "1", "B": "two words", "C": "x", "D": "spaced", "E": "a=b"})
 
@@ -72,20 +73,24 @@ class RoutesFileTests(unittest.TestCase):
             os.unlink(f.name)
 
     def test_valid_routes_are_added(self):
-        self.load({"routes": {
-            "netbox": {"upstream": "https://nb.example.com", "env": "NB", "auth": "token"},
-            "local": {"upstream": "http://localhost:4000", "env": "L"},
-        }})
+        self.load(
+            {
+                "routes": {
+                    "netbox": {"upstream": "https://nb.example.com", "env": "NB", "auth": "token"},
+                    "local": {"upstream": "http://localhost:4000", "env": "L"},
+                }
+            }
+        )
         self.assertEqual(proxy.ROUTES["netbox"], ("https://nb.example.com", "NB", "token"))
         self.assertEqual(proxy.ROUTES["local"], ("http://localhost:4000", "L", "bearer"))
 
     def test_rejects_bad_routes(self):
         bad = [
-            {"upstream": "http://api.example.com", "env": "K"},              # cleartext over network
-            {"upstream": "ftp://x.example.com", "env": "K"},                 # bad scheme
+            {"upstream": "http://api.example.com", "env": "K"},  # cleartext over network
+            {"upstream": "ftp://x.example.com", "env": "K"},  # bad scheme
             {"upstream": "https://x.example.com", "env": "K", "auth": "?"},  # unknown auth style
             {"upstream": "https://x.example.com", "env": "K", "auth": "header:Bad Name"},
-            {"upstream": "https://x.example.com"},                           # missing env
+            {"upstream": "https://x.example.com"},  # missing env
         ]
         for spec in bad:
             with self.assertRaises(ValueError, msg=spec):
@@ -100,11 +105,19 @@ class ProxyTests(unittest.TestCase):
         cls.upstream = serve(EchoUpstream)
         cls._routes, cls._keys = dict(proxy.ROUTES), dict(proxy.KEYS)
         proxy.ROUTES.clear()
-        proxy.ROUTES["bear"] = ("http://127.0.0.1:%d/base" % cls.upstream.server_port, "K1", "bearer")
+        proxy.ROUTES["bear"] = (
+            "http://127.0.0.1:%d/base" % cls.upstream.server_port,
+            "K1",
+            "bearer",
+        )
         proxy.ROUTES["xkey"] = ("http://127.0.0.1:%d" % cls.upstream.server_port, "K2", "x-api-key")
         proxy.ROUTES["nokey"] = ("http://127.0.0.1:1", "K3", "bearer")
         proxy.ROUTES["tok"] = ("http://127.0.0.1:%d" % cls.upstream.server_port, "K4", "token")
-        proxy.ROUTES["hdr"] = ("http://127.0.0.1:%d" % cls.upstream.server_port, "K5", "header:X-Auth-Token")
+        proxy.ROUTES["hdr"] = (
+            "http://127.0.0.1:%d" % cls.upstream.server_port,
+            "K5",
+            "header:X-Auth-Token",
+        )
         proxy.KEYS.clear()
         proxy.KEYS.update({"bear": "REAL-1", "xkey": "REAL-2", "tok": "REAL-4", "hdr": "REAL-5"})
         cls.proxy = serve(proxy.Handler)
@@ -131,9 +144,15 @@ class ProxyTests(unittest.TestCase):
         self.assertEqual(out["path"], "/base/v1/models")
 
     def test_x_api_key_style_and_dummy_stripped(self):
-        out = self.call("/xkey/v1/messages", data=b'{"a":1}',
-                        headers={"x-api-key": "dummy", "Authorization": "Bearer dummy",
-                                 "Content-Type": "application/json"})
+        out = self.call(
+            "/xkey/v1/messages",
+            data=b'{"a":1}',
+            headers={
+                "x-api-key": "dummy",
+                "Authorization": "Bearer dummy",
+                "Content-Type": "application/json",
+            },
+        )
         self.assertEqual(out["headers"]["x-api-key"], "REAL-2")
         self.assertNotIn("Authorization", out["headers"])
         self.assertEqual(out["body"], '{"a":1}')

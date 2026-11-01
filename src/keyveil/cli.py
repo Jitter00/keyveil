@@ -1,11 +1,12 @@
 """keyveil command line: unlock keys once, then run the in-memory key-injecting proxy.
 
-    keyveil init      write a starter config file
-    keyveil start     decrypt your keys and start the proxy in the background
-    keyveil status    is it running?
-    keyveil stop      stop it (the keys vanish with the process)
-    keyveil run       run in the foreground (or `--stdin` to read KEY=VALUE from a pipe)
+keyveil init      write a starter config file
+keyveil start     decrypt your keys and start the proxy in the background
+keyveil status    is it running?
+keyveil stop      stop it (the keys vanish with the process)
+keyveil run       run in the foreground (or `--stdin` to read KEY=VALUE from a pipe)
 """
+
 import argparse
 import os
 import signal
@@ -27,6 +28,7 @@ class CLIError(Exception):
 
 
 # ---------------------------------------------------------------- process helpers
+
 
 def _pid_file(port):
     return cfgmod.runtime_dir() / ("%d.pid" % port)
@@ -87,6 +89,7 @@ def _log_tail(path, offset):
 
 # ---------------------------------------------------------------- getting the keys
 
+
 def get_secrets(cfg):
     """Run the decrypt step and return the ``KEY=VALUE`` text. Never printed or logged.
 
@@ -97,18 +100,23 @@ def get_secrets(cfg):
         argv, shell = cfg.decrypt_command, True
     else:
         if cfg.age_identity is None:
-            raise CLIError("no key source configured. Run `keyveil init`, then set [age] "
-                           "identity (and file) or [decrypt] command in the config file")
+            raise CLIError(
+                "no key source configured. Run `keyveil init`, then set [age] "
+                "identity (and file) or [decrypt] command in the config file"
+            )
         if not cfg.age_file.is_file():
             raise CLIError("encrypted file not found: %s" % cfg.age_file)
         argv = [cfg.age_binary, "-d", "-i", str(cfg.age_identity), str(cfg.age_file)]
         shell = False
-    print("Unlocking keys (touch your YubiKey / enter your passphrase if prompted)...",
-          file=sys.stderr)
+    print(
+        "Unlocking keys (touch your YubiKey / enter your passphrase if prompted)...",
+        file=sys.stderr,
+    )
     try:
-        result = subprocess.run(argv, shell=shell, stdout=subprocess.PIPE, text=True)
+        # The command comes from the user's own config (documented as trusted code).
+        result = subprocess.run(argv, shell=shell, stdout=subprocess.PIPE, text=True)  # noqa: S603
     except FileNotFoundError:
-        raise CLIError("cannot run %r: command not found" % (argv if shell else argv[0]))
+        raise CLIError("cannot run %r: command not found" % (argv if shell else argv[0])) from None
     if result.returncode != 0:
         raise CLIError("decryption failed (exit status %d)" % result.returncode)
     if not result.stdout.strip():
@@ -118,9 +126,11 @@ def get_secrets(cfg):
 
 # ---------------------------------------------------------------- commands
 
+
 def _load(args):
-    return cfgmod.load(args.config, port=args.port,
-                       decrypt_command=getattr(args, "decrypt_cmd", None))
+    return cfgmod.load(
+        args.config, port=args.port, decrypt_command=getattr(args, "decrypt_cmd", None)
+    )
 
 
 def cmd_start(args):
@@ -144,20 +154,23 @@ def cmd_start(args):
     with open(log_path, "ab") as log:
         offset = log.tell()
         # The keys go to the child's stdin only: never argv, environment, or a file.
-        proc = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=log, stderr=log,
-                                start_new_session=True)
+        proc = subprocess.Popen(  # noqa: S603 - argv is our own interpreter + module
+            argv, stdin=subprocess.PIPE, stdout=log, stderr=log, start_new_session=True
+        )
     try:
         proc.stdin.write(secrets.encode())
         proc.stdin.close()
     except BrokenPipeError:
-        pass                       # the child already exited; reported below
+        pass  # the child already exited; reported below
     del secrets
 
     deadline = time.monotonic() + START_TIMEOUT
     while time.monotonic() < deadline:
         if proc.poll() is not None:
-            raise CLIError("failed to start: %s (log: %s)"
-                           % (_log_tail(log_path, offset) or "exited", log_path))
+            raise CLIError(
+                "failed to start: %s (log: %s)"
+                % (_log_tail(log_path, offset) or "exited", log_path)
+            )
         if _port_open(port):
             _private_dir(cfgmod.runtime_dir())
             _pid_file(port).write_text("%d\n" % proc.pid)
@@ -211,7 +224,7 @@ def cmd_run(args):
         try:
             proxy.load_routes_file(cfg.routes_file)
         except (OSError, ValueError) as e:
-            raise CLIError("bad routes file %s: %s" % (cfg.routes_file, e))
+            raise CLIError("bad routes file %s: %s" % (cfg.routes_file, e)) from e
     text = sys.stdin.read() if args.stdin else get_secrets(cfg)
     proxy.serve(text, HOST, cfg.port, idle_timeout=cfg.idle_timeout)
     return 0
@@ -221,30 +234,37 @@ def cmd_sandbox(args):
     from . import proxy, sandbox
 
     cfg = cfgmod.load(args.config)
-    if cfg.routes_file:                 # so the sandbox strips custom routes' key variables too
+    if cfg.routes_file:  # so the sandbox strips custom routes' key variables too
         try:
             proxy.load_routes_file(cfg.routes_file)
         except (OSError, ValueError) as e:
-            raise CLIError("bad routes file %s: %s" % (cfg.routes_file, e))
+            raise CLIError("bad routes file %s: %s" % (cfg.routes_file, e)) from e
     try:
         argv, removed, warnings = sandbox.build(
-            args.command, project=args.project or os.getcwd(), cfg=cfg,
-            extra_rw=args.rw, extra_hide=args.hide, keep_env=args.keep_env,
-            ssh_agent=args.ssh_agent)
+            args.command,
+            project=args.project or os.getcwd(),
+            cfg=cfg,
+            extra_rw=args.rw,
+            extra_hide=args.hide,
+            keep_env=args.keep_env,
+            ssh_agent=args.ssh_agent,
+        )
         if args.dry_run:
             print(sandbox.describe(argv))
             return 0
         sandbox.preflight()
     except sandbox.SandboxError as e:
-        raise CLIError(str(e))
+        raise CLIError(str(e)) from e
     for w in warnings:
         print("keyveil sandbox: %s" % w, file=sys.stderr)
     if removed:  # names only, never values
-        print("keyveil sandbox: removed from the environment: %s" % ", ".join(removed),
-              file=sys.stderr)
+        print(
+            "keyveil sandbox: removed from the environment: %s" % ", ".join(removed),
+            file=sys.stderr,
+        )
     sys.stdout.flush()
     sys.stderr.flush()
-    os.execvp(argv[0], argv)
+    os.execvp(argv[0], argv)  # noqa: S606 - replace ourselves with bwrap (argv list, no shell)
 
 
 def cmd_init(args):
@@ -260,6 +280,7 @@ def cmd_init(args):
 
 # ---------------------------------------------------------------- entry point
 
+
 def _version():
     try:
         return metadata.version("keyveil")
@@ -269,71 +290,108 @@ def _version():
 
 def build_parser():
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--config", metavar="FILE",
-                        help="config file (default: ~/.config/keyveil/config.toml)")
-    common.add_argument("--port", type=int,
-                        help="listen port (default: from the config file, else %d)"
-                        % cfgmod.DEFAULT_PORT)
+    common.add_argument(
+        "--config", metavar="FILE", help="config file (default: ~/.config/keyveil/config.toml)"
+    )
+    common.add_argument(
+        "--port",
+        type=int,
+        help="listen port (default: from the config file, else %d)" % cfgmod.DEFAULT_PORT,
+    )
 
     parser = argparse.ArgumentParser(prog="keyveil", description=__doc__.split("\n")[0])
     parser.add_argument("--version", action="version", version="keyveil " + _version())
-    sub = parser.add_subparsers(dest="command", required=True,
-                                metavar="{init,start,stop,status,run}")
+    sub = parser.add_subparsers(
+        dest="command", required=True, metavar="{init,start,stop,status,run}"
+    )
 
     p = sub.add_parser("init", help="write a starter config file")
     p.add_argument("--config", metavar="FILE", help="where to write it")
     p.set_defaults(func=cmd_init)
 
-    p = sub.add_parser("start", parents=[common],
-                       help="unlock your keys and start the proxy in the background")
-    p.add_argument("--decrypt-cmd", metavar="CMD",
-                   help="shell command printing KEY=VALUE lines (overrides the config)")
+    p = sub.add_parser(
+        "start", parents=[common], help="unlock your keys and start the proxy in the background"
+    )
+    p.add_argument(
+        "--decrypt-cmd",
+        metavar="CMD",
+        help="shell command printing KEY=VALUE lines (overrides the config)",
+    )
     p.set_defaults(func=cmd_start)
 
     p = sub.add_parser("stop", parents=[common], help="stop the background proxy")
     p.set_defaults(func=cmd_stop)
 
-    p = sub.add_parser("status", parents=[common],
-                       help="show whether the proxy is running (exit 0 yes, 3 no)")
+    p = sub.add_parser(
+        "status", parents=[common], help="show whether the proxy is running (exit 0 yes, 3 no)"
+    )
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("run", parents=[common], help="run in the foreground")
-    p.add_argument("--stdin", action="store_true",
-                   help="read KEY=VALUE lines from stdin instead of decrypting")
-    p.add_argument("--decrypt-cmd", metavar="CMD",
-                   help="shell command printing KEY=VALUE lines (overrides the config)")
+    p.add_argument(
+        "--stdin", action="store_true", help="read KEY=VALUE lines from stdin instead of decrypting"
+    )
+    p.add_argument(
+        "--decrypt-cmd",
+        metavar="CMD",
+        help="shell command printing KEY=VALUE lines (overrides the config)",
+    )
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser(
-        "sandbox", usage="keyveil sandbox [options] -- COMMAND [ARGS...]",
+        "sandbox",
+        usage="keyveil sandbox [options] -- COMMAND [ARGS...]",
         help="run an agent (e.g. claude) confined with bubblewrap",
         description="Run COMMAND so it can edit the project and use the keyveil proxy, but "
-                    "cannot become root, reach Docker, read common secret stores, or tamper "
-                    "with files outside the project. See README, 'Threat model'.")
-    p.add_argument("--config", metavar="FILE",
-                   help="config file (default: ~/.config/keyveil/config.toml)")
-    p.add_argument("--project", metavar="DIR",
-                   help="directory the agent may write (default: the current directory)")
-    p.add_argument("--rw", action="append", default=[], metavar="PATH",
-                   help="also make PATH writable (repeatable)")
-    p.add_argument("--hide", action="append", default=[], metavar="PATH",
-                   help="also hide PATH (repeatable)")
-    p.add_argument("--keep-env", action="append", default=[], metavar="NAME",
-                   help="keep this environment variable even if it looks secret (repeatable)")
-    p.add_argument("--ssh-agent", action="store_true",
-                   help="give the agent your ssh-agent socket (e.g. for git push over ssh)")
+        "cannot become root, reach Docker, read common secret stores, or tamper "
+        "with files outside the project. See README, 'Threat model'.",
+    )
+    p.add_argument(
+        "--config", metavar="FILE", help="config file (default: ~/.config/keyveil/config.toml)"
+    )
+    p.add_argument(
+        "--project",
+        metavar="DIR",
+        help="directory the agent may write (default: the current directory)",
+    )
+    p.add_argument(
+        "--rw",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="also make PATH writable (repeatable)",
+    )
+    p.add_argument(
+        "--hide", action="append", default=[], metavar="PATH", help="also hide PATH (repeatable)"
+    )
+    p.add_argument(
+        "--keep-env",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="keep this environment variable even if it looks secret (repeatable)",
+    )
+    p.add_argument(
+        "--ssh-agent",
+        action="store_true",
+        help="give the agent your ssh-agent socket (e.g. for git push over ssh)",
+    )
     p.add_argument("--dry-run", action="store_true", help="print the bwrap command and exit")
-    p.add_argument("command", nargs="*", metavar="COMMAND",
-                   help="the agent to run; put it after `--` if it has its own options")
+    p.add_argument(
+        "command",
+        nargs="*",
+        metavar="COMMAND",
+        help="the agent to run; put it after `--` if it has its own options",
+    )
     p.set_defaults(func=cmd_sandbox)
     return parser
 
 
 def _split_sandbox_command(argv):
     """`keyveil sandbox [opts] -- cmd args`: everything after the first `--` is the command."""
-    if "sandbox" in argv and "--" in argv[argv.index("sandbox"):]:
+    if "sandbox" in argv and "--" in argv[argv.index("sandbox") :]:
         cut = argv.index("--", argv.index("sandbox"))
-        return argv[:cut], argv[cut + 1:]
+        return argv[:cut], argv[cut + 1 :]
     return argv, None
 
 

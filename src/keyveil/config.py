@@ -1,4 +1,5 @@
 """keyveil configuration: a TOML file in the XDG config dir. Read as data, never executed."""
+
 import os
 import shutil
 import tomllib
@@ -66,10 +67,10 @@ class Config:
     age_identity: Path | None = None
     age_file: Path | None = None
     age_binary: str = "age"
-    idle_timeout: float = 0.0             # seconds; 0 = never
-    sandbox_rw: tuple = ()                # extra writable paths for `keyveil sandbox`
-    sandbox_hide: tuple = ()              # extra hidden paths for `keyveil sandbox`
-    source: Path | None = None            # the file this was loaded from, if any
+    idle_timeout: float = 0.0  # seconds; 0 = never
+    sandbox_rw: tuple = ()  # extra writable paths for `keyveil sandbox`
+    sandbox_hide: tuple = ()  # extra hidden paths for `keyveil sandbox`
+    source: Path | None = None  # the file this was loaded from, if any
 
 
 _TOP = {"port", "routes_file", "idle_timeout", "age", "decrypt", "sandbox"}
@@ -88,8 +89,10 @@ def _path_list(table, key, where):
 def _check_keys(table, allowed, where):
     unknown = sorted(set(table) - allowed)
     if unknown:
-        raise ConfigError("%s: unknown key(s) %s (allowed: %s)"
-                          % (where, ", ".join(unknown), ", ".join(sorted(allowed))))
+        raise ConfigError(
+            "%s: unknown key(s) %s (allowed: %s)"
+            % (where, ", ".join(unknown), ", ".join(sorted(allowed)))
+        )
 
 
 def _string(table, key, where):

@@ -10,6 +10,7 @@ keyveil proxy on 127.0.0.1. What it can no longer do:
   * see or signal other processes (own PID namespace), including the keyveil proxy.
 Network access is shared with the host (the agent needs the proxy and usually the internet).
 """
+
 import fnmatch
 import os
 import shlex
@@ -24,17 +25,45 @@ from . import proxy
 # Hidden from the agent if they exist (relative to $HOME). Directories get an empty tmpfs,
 # files are replaced by /dev/null.
 HIDDEN_IN_HOME = (
-    ".ssh", ".gnupg", ".password-store", ".local/share/keyrings", ".aws", ".azure",
-    ".config/gcloud", ".kube", ".docker", ".netrc", ".git-credentials", ".pgpass",
-    ".mozilla", ".config/google-chrome", ".config/chromium", ".config/BraveSoftware",
-    ".bash_history", ".zsh_history", ".python_history", ".lesshst",
+    ".ssh",
+    ".gnupg",
+    ".password-store",
+    ".local/share/keyrings",
+    ".aws",
+    ".azure",
+    ".config/gcloud",
+    ".kube",
+    ".docker",
+    ".netrc",
+    ".git-credentials",
+    ".pgpass",
+    ".mozilla",
+    ".config/google-chrome",
+    ".config/chromium",
+    ".config/BraveSoftware",
+    ".bash_history",
+    ".zsh_history",
+    ".python_history",
+    ".lesshst",
 )
 # Writable for the agent if they exist (relative to $HOME): Claude Code's state.
 AGENT_STATE = (".claude", ".claude.json")
 # Environment variables removed before the agent starts (fnmatch, case-sensitive).
-SECRET_ENV = ("*_API_KEY", "*_APIKEY", "*_TOKEN", "*_SECRET", "*_SECRET_*", "*SECRET_KEY*",
-              "*_PASSWORD", "*_PASSWD", "AWS_*", "AZURE_*", "GOOGLE_APPLICATION_CREDENTIALS",
-              "SSH_AUTH_SOCK", "GPG_AGENT_INFO")
+SECRET_ENV = (
+    "*_API_KEY",
+    "*_APIKEY",
+    "*_TOKEN",
+    "*_SECRET",
+    "*_SECRET_*",
+    "*SECRET_KEY*",
+    "*_PASSWORD",
+    "*_PASSWD",
+    "AWS_*",
+    "AZURE_*",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "SSH_AUTH_SOCK",
+    "GPG_AGENT_INFO",
+)
 
 
 class SandboxError(Exception):
@@ -59,8 +88,19 @@ def _tiocsti_possible():
         return True  # kernels before 6.2 have no switch: injection is possible
 
 
-def build(command, *, project, cfg, home=None, environ=None, extra_rw=(), extra_hide=(),
-          keep_env=(), ssh_agent=False, prefix=None):
+def build(
+    command,
+    *,
+    project,
+    cfg,
+    home=None,
+    environ=None,
+    extra_rw=(),
+    extra_hide=(),
+    keep_env=(),
+    ssh_agent=False,
+    prefix=None,
+):
     """Return (bwrap argv, removed env var names, warnings). Pure: inspects but never runs."""
     if not command:
         raise SandboxError("no command given. Usage: keyveil sandbox [options] -- COMMAND [ARGS]")
@@ -70,13 +110,29 @@ def build(command, *, project, cfg, home=None, environ=None, extra_rw=(), extra_
     if not project.is_dir():
         raise SandboxError("project directory not found: %s" % project)
     if project == home or project in home.parents or project == Path("/"):
-        raise SandboxError("refusing to make %s writable: pick a project directory below your "
-                           "home directory" % project)
+        raise SandboxError(
+            "refusing to make %s writable: pick a project directory below your "
+            "home directory" % project
+        )
 
     warnings = []
-    argv = ["bwrap", "--die-with-parent", "--unshare-pid", "--unshare-ipc",
-            "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
-            "--tmpfs", "/run", "--tmpfs", "/tmp"]
+    argv = [
+        "bwrap",
+        "--die-with-parent",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--ro-bind",
+        "/",
+        "/",
+        "--dev",
+        "/dev",
+        "--proc",
+        "/proc",
+        "--tmpfs",
+        "/run",
+        "--tmpfs",
+        "/tmp",  # noqa: S108 - a mount point inside the sandbox, not a temp file
+    ]
     # /etc/resolv.conf is often a symlink into /run (systemd-resolved); give back just that
     # file, read-only, so DNS keeps working. The resolver's control socket stays hidden.
     resolv = Path("/etc/resolv.conf").resolve()
@@ -87,8 +143,10 @@ def build(command, *, project, cfg, home=None, environ=None, extra_rw=(), extra_
         argv += ["--dir", runtime, "--chmod", "0700", runtime]
     if _tiocsti_possible():
         argv.append("--new-session")
-        warnings.append("this kernel allows terminal keystroke injection; running the agent "
-                        "in a new session (some terminal features may not work)")
+        warnings.append(
+            "this kernel allows terminal keystroke injection; running the agent "
+            "in a new session (some terminal features may not work)"
+        )
 
     def hide(path):
         path = Path(path)
@@ -98,7 +156,7 @@ def build(command, *, project, cfg, home=None, environ=None, extra_rw=(), extra_
             argv.extend(["--ro-bind", "/dev/null", str(path)])
 
     if (home / ".cache").is_dir():
-        argv += ["--tmpfs", str(home / ".cache")]   # private scratch; nothing persists
+        argv += ["--tmpfs", str(home / ".cache")]  # private scratch; nothing persists
     for rel in HIDDEN_IN_HOME:
         hide(home / rel)
     # keyveil itself: config, log/state, the installed environment, and the key files.
@@ -106,7 +164,7 @@ def build(command, *, project, cfg, home=None, environ=None, extra_rw=(), extra_
         hide(path)
     prefix = Path(prefix or sys.prefix).resolve()
     if home in prefix.parents and prefix != project and project not in prefix.parents:
-        hide(prefix)                                # e.g. ~/.local/share/uv/tools/keyveil
+        hide(prefix)  # e.g. ~/.local/share/uv/tools/keyveil
     for path in (cfg.age_file, cfg.age_identity):
         if path:
             hide(path)
@@ -120,7 +178,7 @@ def build(command, *, project, cfg, home=None, environ=None, extra_rw=(), extra_
 
     argv += ["--bind", str(project), str(project)]
     git = project / ".git"
-    if git.is_dir():                                # these run code later, outside the sandbox
+    if git.is_dir():  # these run code later, outside the sandbox
         for rel in ("hooks", "config"):
             if (git / rel).exists():
                 argv += ["--ro-bind", str(git / rel), str(git / rel)]
@@ -149,14 +207,21 @@ def build(command, *, project, cfg, home=None, environ=None, extra_rw=(), extra_
 def preflight():
     """Fail early with a helpful message if bwrap can't run here."""
     if not shutil.which("bwrap"):
-        raise SandboxError("bubblewrap is not installed (Ubuntu/Debian: sudo apt install bubblewrap)")
-    probe = subprocess.run(["bwrap", "--ro-bind", "/", "/", "--", "true"],
-                           capture_output=True, text=True)
+        raise SandboxError(
+            "bubblewrap is not installed (Ubuntu/Debian: sudo apt install bubblewrap)"
+        )
+    probe = subprocess.run(  # noqa: S603 - fixed argv
+        ["bwrap", "--ro-bind", "/", "/", "--", "true"],  # noqa: S607 - bwrap from PATH
+        capture_output=True,
+        text=True,
+    )
     if probe.returncode != 0:
-        raise SandboxError("bubblewrap cannot create a sandbox here (%s). Unprivileged user "
-                           "namespaces may be disabled; on Ubuntu 24.04+ see "
-                           "kernel.apparmor_restrict_unprivileged_userns"
-                           % (probe.stderr.strip() or "exit %d" % probe.returncode))
+        raise SandboxError(
+            "bubblewrap cannot create a sandbox here (%s). Unprivileged user "
+            "namespaces may be disabled; on Ubuntu 24.04+ see "
+            "kernel.apparmor_restrict_unprivileged_userns"
+            % (probe.stderr.strip() or "exit %d" % probe.returncode)
+        )
 
 
 def describe(argv):

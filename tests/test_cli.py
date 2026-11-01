@@ -1,7 +1,7 @@
 """CLI tests: run `python -m keyveil` in an isolated sandbox (own HOME/XDG dirs, free port,
 stub decrypt commands). No YubiKey, no network, no real keys; never touches port 8787."""
+
 import os
-import re
 import shutil
 import signal
 import socket
@@ -40,12 +40,13 @@ class CliTestCase(unittest.TestCase):
         self.port = free_port()
         for d in ("home", "run"):
             (self.tmp / d).mkdir(mode=0o700)
-        self.env = {k: v for k, v in os.environ.items()
-                    if not k.startswith(("KEYVEIL_", "XDG_"))}
-        self.env.update(HOME=str(self.tmp / "home"),
-                        XDG_CONFIG_HOME=str(self.tmp / "config"),
-                        XDG_STATE_HOME=str(self.tmp / "state"),
-                        XDG_RUNTIME_DIR=str(self.tmp / "run"))
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("KEYVEIL_", "XDG_"))}
+        self.env.update(
+            HOME=str(self.tmp / "home"),
+            XDG_CONFIG_HOME=str(self.tmp / "config"),
+            XDG_STATE_HOME=str(self.tmp / "state"),
+            XDG_RUNTIME_DIR=str(self.tmp / "run"),
+        )
         self.secret_file = self.write("plain.env", "DEEPSEEK_API_KEY=%s\n" % SECRET)
         self.pidfile = self.tmp / "run" / "keyveil" / ("%d.pid" % self.port)
         self.addCleanup(self.kill_proxy)
@@ -59,15 +60,21 @@ class CliTestCase(unittest.TestCase):
         return path
 
     def keyveil(self, *args):
-        return subprocess.run([sys.executable, "-m", "keyveil", *args], env=self.env,
-                              capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                              timeout=30)
+        return subprocess.run(
+            [sys.executable, "-m", "keyveil", *args],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            timeout=30,
+        )
 
     def config(self, command=None, top=""):
         """Write the default-location config with a [decrypt] command (default: cat the stub)."""
         command = command or "cat %s" % self.secret_file
-        return self.config_text('port = %d\n%s\n[decrypt]\ncommand = \'%s\'\n'
-                                % (self.port, top, command))
+        return self.config_text(
+            "port = %d\n%s\n[decrypt]\ncommand = '%s'\n" % (self.port, top, command)
+        )
 
     def config_text(self, text):
         path = self.tmp / "config" / "keyveil" / "config.toml"
@@ -96,14 +103,15 @@ class CliTestCase(unittest.TestCase):
 class LifecycleTests(CliTestCase):
     def test_start_status_stop(self):
         # A shell feature in the command proves it runs through /bin/sh.
-        self.config(command='printf "DEEPSEEK_API_KEY=%%s\\n" "$(cat %s | cut -d= -f2)"'
-                    % self.secret_file)
+        self.config(
+            command='printf "DEEPSEEK_API_KEY=%%s\\n" "$(cat %s | cut -d= -f2)"' % self.secret_file
+        )
         r = self.keyveil("start")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("ok", r.stdout)
         s = self.keyveil("status")
         self.assertEqual((s.returncode, "running" in s.stdout), (0, True), s.stdout)
-        self.assertEqual(self.status_code("/nope/x"), 404)            # the proxy answers
+        self.assertEqual(self.status_code("/nope/x"), 404)  # the proxy answers
         again = self.keyveil("start")
         self.assertEqual(again.returncode, 0)
         self.assertIn("already running", again.stdout)
@@ -139,7 +147,7 @@ class FailureTests(CliTestCase):
             "exit 3": "exit status 3",
             "true": "printed nothing",
             "/nonexistent/cmd": "decryption failed",
-            "cat %s; exit 1" % self.secret_file: "decryption failed",   # prints secret, then fails
+            "cat %s; exit 1" % self.secret_file: "decryption failed",  # prints secret, then fails
         }
         for command, message in cases.items():
             self.config(command=command)
@@ -152,14 +160,19 @@ class FailureTests(CliTestCase):
     def test_age_mode_problems_are_explained(self):
         enc = self.write("keys.age", "x")
         ident = self.write("id.txt", "x")
-        self.config_text('port = %d\n[age]\nbinary = "/nonexistent/age"\nfile = "%s"\n'
-                         % (self.port, enc))
+        self.config_text(
+            'port = %d\n[age]\nbinary = "/nonexistent/age"\nfile = "%s"\n' % (self.port, enc)
+        )
         self.assertIn("no key source configured", self.keyveil("start").stderr)
-        self.config_text('port = %d\n[age]\nidentity = "%s"\nfile = "%s"\nbinary = "/nonexistent/age"\n'
-                         % (self.port, ident, enc))
+        self.config_text(
+            'port = %d\n[age]\nidentity = "%s"\nfile = "%s"\nbinary = "/nonexistent/age"\n'
+            % (self.port, ident, enc)
+        )
         self.assertIn("cannot run", self.keyveil("start").stderr)
-        self.config_text('port = %d\n[age]\nidentity = "%s"\nfile = "%s"\n'
-                         % (self.port, ident, self.tmp / "missing.age"))
+        self.config_text(
+            'port = %d\n[age]\nidentity = "%s"\nfile = "%s"\n'
+            % (self.port, ident, self.tmp / "missing.age")
+        )
         self.assertIn("encrypted file not found", self.keyveil("start").stderr)
 
     def test_proxy_that_exits_early_is_reported_by_variable_names_only(self):
@@ -172,8 +185,9 @@ class FailureTests(CliTestCase):
         self.assertNotIn("whatever-value", r.stdout + r.stderr)
 
     def test_bad_routes_file_is_reported_and_nothing_starts(self):
-        routes = self.write("routes.json",
-                            '{"routes": {"x": {"upstream": "http://evil.example.com", "env": "K"}}}')
+        routes = self.write(
+            "routes.json", '{"routes": {"x": {"upstream": "http://evil.example.com", "env": "K"}}}'
+        )
         self.config(top='routes_file = "%s"' % routes)
         r = self.keyveil("start")
         self.assertEqual(r.returncode, 1)
@@ -189,7 +203,7 @@ class FailureTests(CliTestCase):
         r = self.keyveil("start")
         self.assertEqual(r.returncode, 1)
         self.assertIn("already in use", r.stderr)
-        self.assertEqual(self.keyveil("status").returncode, 3)         # not ours
+        self.assertEqual(self.keyveil("status").returncode, 3)  # not ours
 
     def test_bad_config_is_a_clean_error(self):
         self.config_text("port = = 1\n")
@@ -232,11 +246,11 @@ class SecretHygieneTests(CliTestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assert_no_secret(r)
         pid = int(self.pidfile.read_text())
-        self.assertRegex(self.pidfile.read_text(), r"^\d+\n?$")        # a pid, nothing else
+        self.assertRegex(self.pidfile.read_text(), r"^\d+\n?$")  # a pid, nothing else
         cmdline = Path("/proc/%d/cmdline" % pid).read_bytes()
         self.assertIn(b"keyveil.proxy", cmdline)
         self.assertNotIn(SECRET.encode(), cmdline)
-        with self.assertRaises(PermissionError):                         # dumpable=0
+        with self.assertRaises(PermissionError):  # dumpable=0
             Path("/proc/%d/environ" % pid).read_bytes()
         # The key must not be in any file the CLI or proxy wrote (only our own stub holds it).
         for path in self.tmp.rglob("*"):
@@ -246,10 +260,14 @@ class SecretHygieneTests(CliTestCase):
 
 class RunTests(CliTestCase):
     def test_run_stdin_serves_and_exits_cleanly_on_sigterm(self):
-        proc = subprocess.Popen([sys.executable, "-m", "keyveil", "run", "--stdin",
-                                 "--port", str(self.port)], env=self.env, text=True,
-                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "keyveil", "run", "--stdin", "--port", str(self.port)],
+            env=self.env,
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         self.addCleanup(proc.kill)
         self.addCleanup(lambda: [f.close() for f in (proc.stdin, proc.stdout, proc.stderr)])
         proc.stdin.write("DEEPSEEK_API_KEY=%s\n" % SECRET)
@@ -266,14 +284,21 @@ class RunTests(CliTestCase):
 class AgeStubTests(CliTestCase):
     def test_age_is_called_with_exactly_the_documented_arguments(self):
         enc, ident = self.write("keys.age", "x"), self.write("id.txt", "x")
-        stub = self.write("fakeage", '#!/bin/sh\nprintf "%s\\n" "$@" > "$(dirname "$0")/argv.txt"\n'
-                          'printf "OPENAI_API_KEY=k\\n"\n', mode=0o755)
-        self.config_text('port = %d\n[age]\nidentity = "%s"\nfile = "%s"\nbinary = "%s"\n'
-                         % (self.port, ident, enc, stub))
+        stub = self.write(
+            "fakeage",
+            '#!/bin/sh\nprintf "%s\\n" "$@" > "$(dirname "$0")/argv.txt"\n'
+            'printf "OPENAI_API_KEY=k\\n"\n',
+            mode=0o755,
+        )
+        self.config_text(
+            'port = %d\n[age]\nidentity = "%s"\nfile = "%s"\nbinary = "%s"\n'
+            % (self.port, ident, enc, stub)
+        )
         r = self.keyveil("start")
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual((self.tmp / "argv.txt").read_text().split("\n")[:-1],
-                         ["-d", "-i", str(ident), str(enc)])
+        self.assertEqual(
+            (self.tmp / "argv.txt").read_text().split("\n")[:-1], ["-d", "-i", str(ident), str(enc)]
+        )
         log = (self.tmp / "state" / "keyveil" / "keyveil.log").read_text()
         self.assertIn("routes=openai", log)
 

@@ -13,6 +13,7 @@ upstream. A route is only enabled if its key is present on stdin.
 This file is self-contained (standard library only) so it can be run directly
 with ``python3 -I`` as well as through the ``keyveil`` console script.
 """
+
 import argparse
 import ctypes
 import fnmatch
@@ -42,8 +43,16 @@ ROUTES = {
 }
 
 HOP_BY_HOP = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailers",
+    "transfer-encoding",
+    "upgrade",
+    "host",
+    "content-length",
     "accept-encoding",
 }
 STRIP_AUTH = {"authorization", "x-api-key", "api-key"}
@@ -76,8 +85,9 @@ def auth_header(style, key):
     raise ValueError("unknown auth style %r" % style)
 
 
-_PRIVATE_NETS = tuple(ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12",
-                                                          "192.168.0.0/16"))
+_PRIVATE_NETS = tuple(
+    ipaddress.ip_network(n) for n in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")
+)
 
 
 def _private_ip(host):
@@ -104,7 +114,7 @@ def validate_route(name, spec):
     try:
         upstream, env_name, style = spec["upstream"], spec["env"], spec.get("auth", "bearer")
     except (KeyError, TypeError, AttributeError):
-        raise ValueError("route %r needs 'upstream' and 'env' (optional 'auth')" % name)
+        raise ValueError("route %r needs 'upstream' and 'env' (optional 'auth')" % name) from None
     auth_header(style, "x")  # raises on unknown style
     u = urlsplit(upstream)
     allow_http = spec.get("allow_http", False)
@@ -113,15 +123,20 @@ def validate_route(name, spec):
     if u.scheme == "https":
         pass
     elif u.scheme == "http" and u.hostname in ("127.0.0.1", "localhost", "::1"):
-        pass  # plain http is only allowed for loopback backends (keys must not cross a network in clear)
+        # plain http only for loopback backends: keys must not cross a network in clear
+        pass
     elif u.scheme == "http" and allow_http and _private_ip(u.hostname):
         pass  # explicit opt-in: plain http to a literal private address (e.g. a local VM)
     elif u.scheme == "http" and allow_http:
-        raise ValueError("route %r: allow_http only works with a literal private IP address "
-                         "(10.x, 172.16-31.x, 192.168.x), not %r" % (name, u.hostname))
+        raise ValueError(
+            "route %r: allow_http only works with a literal private IP address "
+            "(10.x, 172.16-31.x, 192.168.x), not %r" % (name, u.hostname)
+        )
     else:
-        raise ValueError("route %r: upstream must be https:// (or http:// on localhost; "
-                         "for a private-network IP set \"allow_http\": true)" % name)
+        raise ValueError(
+            "route %r: upstream must be https:// (or http:// on localhost; "
+            'for a private-network IP set "allow_http": true)' % name
+        )
     if not u.netloc:
         raise ValueError("route %r: upstream has no host" % name)
     return (upstream, env_name, style)
@@ -133,9 +148,12 @@ def validate_allow(name, spec):
     if rules is None:
         return None
     if not isinstance(rules, list) or not all(
-            isinstance(r, str) and _ALLOW_RULE.fullmatch(r) for r in rules):
-        raise ValueError("route %r: 'allow' must be a list like [\"POST /v1/messages\", "
-                         "\"GET /v1/models*\"]" % name)
+        isinstance(r, str) and _ALLOW_RULE.fullmatch(r) for r in rules
+    ):
+        raise ValueError(
+            "route %r: 'allow' must be a list like [\"POST /v1/messages\", "
+            '"GET /v1/models*"]' % name
+        )
     return list(rules)
 
 
@@ -173,9 +191,9 @@ def harden():
     """
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.prctl(4, 0, 0, 0, 0)          # PR_SET_DUMPABLE = 0
-        libc.mlockall(1 | 2)               # MCL_CURRENT | MCL_FUTURE
-    except Exception:
+        libc.prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE = 0
+        libc.mlockall(1 | 2)  # MCL_CURRENT | MCL_FUTURE
+    except Exception:  # noqa: S110 - best effort; the proxy still works without it
         pass
 
 
@@ -403,10 +421,18 @@ def main(argv=None):
     ap.add_argument("port_pos", nargs="?", type=int, metavar="PORT", help=argparse.SUPPRESS)
     ap.add_argument("--port", type=int, default=None, help="listen port (default 8787)")
     ap.add_argument("--host", default="127.0.0.1", help="bind address (default 127.0.0.1)")
-    ap.add_argument("--routes", metavar="FILE",
-                    help="JSON file with extra routes (see README); contains no secrets")
-    ap.add_argument("--idle-timeout", type=float, default=0, metavar="SECONDS",
-                    help="exit after this many seconds without requests (default: never)")
+    ap.add_argument(
+        "--routes",
+        metavar="FILE",
+        help="JSON file with extra routes (see README); contains no secrets",
+    )
+    ap.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="exit after this many seconds without requests (default: never)",
+    )
     args = ap.parse_args(argv)
     port = args.port or args.port_pos or 8787
     if args.routes:
@@ -431,8 +457,9 @@ def serve(env_text, host="127.0.0.1", port=8787, idle_timeout=0):
     del env
     if not KEYS:
         wanted = sorted(e for _, e, _ in ROUTES.values())
-        sys.exit("keyveil: no usable keys on stdin. wanted=%s found_names=%s"
-                 % (wanted, names))  # names only, never values
+        sys.exit(
+            "keyveil: no usable keys on stdin. wanted=%s found_names=%s" % (wanted, names)
+        )  # names only, never values
 
     srv = ThreadingHTTPServer((host, port), Handler)
     srv.daemon_threads = True
@@ -440,8 +467,7 @@ def serve(env_text, host="127.0.0.1", port=8787, idle_timeout=0):
     if idle_timeout and idle_timeout > 0:
         threading.Thread(target=_idle_watchdog, args=(srv, idle_timeout), daemon=True).start()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    sys.stderr.write("keyveil on %s:%d routes=%s\n"
-                     % (host, port, ",".join(sorted(KEYS))))
+    sys.stderr.write("keyveil on %s:%d routes=%s\n" % (host, port, ",".join(sorted(KEYS))))
     sys.stderr.flush()
     try:
         srv.serve_forever()

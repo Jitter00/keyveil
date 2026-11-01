@@ -9,9 +9,14 @@ requires-python = ">=3.11"
 dependencies = []  # standard library only, on purpose
 keywords = ["llm", "api-key", "credentials", "reverse-proxy", "secrets", "age", "yubikey", "ai-agents", "continue", "cline"]
 classifiers = [
+    "Development Status :: 3 - Alpha",
     "Environment :: Console",
+    "Intended Audience :: Developers",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security",
 ]
 
@@ -24,3 +29,44 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/keyveil"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/keyveil", "tests", "README.md", "LICENSE", "CHANGELOG.md",
+           "config.example.toml", "routes.example.json", ".env.example"]
+
+[dependency-groups]
+dev = ["ruff>=0.6"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S"]
+# The code base uses %-formatting consistently; not worth churning 90 lines.
+ignore = ["UP031"]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests drive subprocesses and use asserts by design.
+"tests/**" = ["S101", "S603", "S607", "S108", "S105", "S106", "S310"]
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+tag_format = "v{version}"
+major_on_zero = false
+allow_zero_version = true
+commit_message = "chore(release): v{version}"
+build_command = ""
+
+[tool.semantic_release.branches.main]
+match = "main"
+prerelease = false
+
+[tool.semantic_release.changelog.default_templates]
+changelog_file = "CHANGELOG.md"
+
+[tool.semantic_release.commit_parser_options]
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf"]
