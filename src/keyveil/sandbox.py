@@ -5,7 +5,9 @@ keyveil proxy on 127.0.0.1. What it can no longer do:
   * become root: no_new_privs blocks sudo/su/pkexec and setuid binaries;
   * reach Docker / LXD / libvirt / ssh-agent / the desktop keyring: /run and /tmp are private;
   * tamper with what runs outside the sandbox: everything except the project and the agent's
-    own state is read-only (~/.bashrc, PATH, keyveil's install and config, .git/hooks, ...);
+    own state is read-only (~/.bashrc, PATH, keyveil's install and config, ...). In the
+    project's git repositories the hooks, config and git dirs can't be changed or swapped,
+    and they are checked again after the agent exits;
   * read common secret stores (~/.ssh, ~/.gnupg, cloud CLI credentials, browser profiles...);
   * see or signal other processes (own PID namespace), including the keyveil proxy;
   * reach anything on the host's loopback or abstract Unix sockets (X11, D-Bus, ibus...):
@@ -13,6 +15,7 @@ keyveil proxy on 127.0.0.1. What it can no longer do:
     relay gives it the keyveil proxy at the usual 127.0.0.1:<port>, and nothing else.
 """
 
+import dataclasses
 import fnmatch
 import json
 import os
@@ -23,6 +26,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from . import bridge, proxy
@@ -95,6 +99,46 @@ SECRET_ENV = (
 )
 
 
+# Not searched for nested git repositories: big, and not where you run git.
+GIT_SCAN_SKIP = frozenset(
+    {"node_modules", ".venv", "venv", "__pycache__", ".tox", ".mypy_cache", ".pytest_cache"}
+)
+# Files in a git dir that git reads config or hooks through. Read-only while the agent runs.
+GIT_READ_ONLY = ("config", "config.worktree", "commondir", "gitdir")
+# Of those, the ones that send git somewhere else when they appear in an existing git dir.
+# They can't be made read-only before they exist, so a new one is moved aside after exit.
+GIT_REDIRECTS = ("commondir", "config.worktree")
+# Config keys (fnmatch on the lowercased name) that make git run a program or read more
+# config. Reported for git repositories the agent created. alias.* is checked separately.
+DANGEROUS_GIT_KEYS = (
+    "core.hookspath",
+    "core.fsmonitor",
+    "core.sshcommand",
+    "core.pager",
+    "core.editor",
+    "core.askpass",
+    "core.gitproxy",
+    "sequence.editor",
+    "pager.*",
+    "diff.external",
+    "diff.*.textconv",
+    "diff.*.command",
+    "merge.*.driver",
+    "filter.*",
+    "credential.helper",
+    "credential.*.helper",
+    "gpg.program",
+    "gpg.*.program",
+    "include.path",
+    "includeif.*.path",
+    "uploadpack.packobjectshook",
+    "remote.*.uploadpack",
+    "remote.*.receivepack",
+    "url.*.insteadof",
+    "url.*.pushinsteadof",
+)
+
+
 class SandboxError(Exception):
     """A problem that prevents starting the sandbox; the message is shown to the user."""
 
@@ -158,6 +202,290 @@ def _pins(hides, roots):
     return sorted(set(pins), key=lambda d: len(d.parts))  # parents first
 
 
+# ---------------------------------------------------------------- git repositories
+
+
+def _inside(path, roots):
+    return any(path == r or r in path.parents for r in roots)
+
+
+def _git_entries(root):
+    """Every `.git` directory or file below ``root`` (symlinks not followed)."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if ".git" in dirnames or ".git" in filenames:
+            found.append(Path(dirpath) / ".git")
+        dirnames[:] = [d for d in dirnames if d != ".git" and d not in GIT_SCAN_SKIP]
+    return found
+
+
+def _gitdir_of(entry):
+    """The git dir a `.git` entry stands for: itself, or where its `gitdir:` line points."""
+    if entry.is_dir():
+        return entry.resolve()
+    try:
+        with open(entry, encoding="utf-8", errors="replace") as f:
+            line = f.readline(4096).strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    return (entry.parent / line[len("gitdir:") :].strip()).resolve()
+
+
+def _commondir(gitdir):
+    """Where a git dir's shared config, hooks and objects live (itself, unless a worktree)."""
+    try:
+        text = (gitdir / "commondir").read_text(encoding="utf-8", errors="replace").strip()
+    except OSError:
+        return gitdir
+    return (gitdir / text).resolve() if text else gitdir
+
+
+def _git_layout(roots):
+    """(`.git` entries below ``roots``, every git dir they use).
+
+    The git dirs include each one's common dir and the git dirs of its submodules
+    (modules/**) and linked worktrees (worktrees/*), wherever those are.
+    """
+    entries = sorted({e for root in roots for e in _git_entries(root)})
+    todo = [g for g in map(_gitdir_of, entries) if g is not None]
+    gitdirs = set()
+    while todo:
+        g = todo.pop()
+        if g in gitdirs or not g.is_dir():
+            continue
+        gitdirs.add(g)
+        todo.append(_commondir(g))
+        if (g / "worktrees").is_dir():
+            todo += [d.resolve() for d in (g / "worktrees").iterdir() if d.is_dir()]
+        for dirpath, dirnames, filenames in os.walk(g / "modules"):
+            if "HEAD" in filenames:  # a submodule's git dir; its own modules come via todo
+                todo.append(Path(dirpath).resolve())
+                dirnames[:] = []
+    return entries, sorted(gitdirs)
+
+
+def _git_env():
+    return {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
+
+def _git_config(args, cwd):
+    """[(origin path or None, lowercased key, value)] from `git config --list -z`, or None."""
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        out = subprocess.run(  # noqa: S603 - fixed argv; only reads config, runs nothing
+            [git, *args, "config", "--list", "--show-origin", "-z"],
+            cwd=cwd,
+            env=_git_env(),
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    items = out.stdout.split(b"\0")
+    result = []
+    for origin, item in zip(items[0::2], items[1::2], strict=False):  # last item: b""
+        origin = origin.decode("utf-8", "replace")
+        key, _, value = item.decode("utf-8", "replace").partition("\n")
+        path = None
+        if origin.startswith("file:"):
+            path = Path(cwd) / Path(origin[len("file:") :]).expanduser()
+        result.append((path, key.lower(), value))
+    return result
+
+
+def _git_protections(roots, writable):
+    """What keeps the agent from planting code that git runs later, outside the sandbox.
+
+    Returns (paths to mount read-only, missing hook dirs to create read-only, paths whose
+    folders must be pinned, warnings). ``roots`` are searched for repositories; only what
+    lies in ``writable`` needs protecting (everything else is read-only anyway).
+    """
+    entries, gitdirs = _git_layout(roots)
+    read_only, create, pin, warnings = set(), set(), [], []
+    for entry in entries:
+        if entry.is_file() and not entry.is_symlink():  # a worktree's or submodule's link
+            read_only.add(entry)
+    for path in [*entries, *(g / name for g in gitdirs for name in ("hooks", *GIT_READ_ONLY))]:
+        if path.is_symlink() and _inside(path.parent.resolve(), writable):
+            warnings.append(
+                "%s is a symbolic link, which keyveil can't make read-only (the agent could "
+                "replace it): make it a real file or folder for sandboxed sessions" % path
+            )
+    for g in gitdirs:
+        if not _inside(g, writable):
+            continue
+        pin.append(g / "hooks")  # pins g itself and everything above it
+        for name in GIT_READ_ONLY:
+            if (g / name).exists():
+                read_only.add(g / name)
+        if (g / "hooks").exists():
+            read_only.add(g / "hooks")
+        elif not (g / "commondir").exists():  # an empty one, so the agent can't add one
+            create.add(g / "hooks")
+    for entry in entries:  # config files (includes) and hook dirs set in config
+        g = _gitdir_of(entry)
+        if g is None:
+            continue
+        for origin, key, value in _git_config(["--git-dir", str(g)], entry.parent) or ():
+            if origin is not None and origin.exists() and _inside(origin.resolve(), writable):
+                read_only.add(origin.resolve())
+            if key == "core.hookspath":
+                base = entry.parent
+            elif key == "include.path" or fnmatch.fnmatchcase(key, "includeif.*.path"):
+                base = origin.parent if origin is not None else entry.parent
+            else:
+                continue
+            target = (base / Path(value).expanduser()).resolve()
+            if not _inside(target, writable):
+                continue
+            if target.exists():
+                read_only.add(target)
+            else:
+                warnings.append(
+                    "%s is set in git config but doesn't exist, so the agent could create "
+                    "it and git would use it outside the sandbox: create it or remove that "
+                    "setting first" % target
+                )
+    pin += sorted(read_only | create)
+    return sorted(read_only), sorted(create), pin, warnings
+
+
+@dataclasses.dataclass
+class GitSnapshot:
+    roots: list
+    entries: set
+    redirects: dict  # git dir -> names from GIT_REDIRECTS present before
+
+
+def snapshot_git(roots):
+    """Record the git repositories below ``roots`` before the agent runs (see audit_git)."""
+    roots = [p for p in (Path(r).expanduser().resolve() for r in roots) if p.is_dir()]
+    entries, gitdirs = _git_layout(roots)
+    redirects = {g: {n for n in GIT_REDIRECTS if os.path.lexists(g / n)} for g in gitdirs}
+    return GitSnapshot(roots, set(entries), redirects)
+
+
+def _printable(text):
+    """Text safe to show in a terminal (agent-chosen names may carry escape sequences)."""
+    return "".join(c if c.isprintable() else "\\x%02x" % ord(c) for c in str(text))
+
+
+def _git_risks(gitdir):
+    """What in a git dir would run a program when you use git there."""
+    risks = []
+    common = _commondir(gitdir)
+    if common != gitdir:
+        risks.append("shares hooks and config with %s" % _printable(common))
+    hooks = common / "hooks"
+    if hooks.is_dir():
+        names = sorted(
+            h.name
+            for h in hooks.iterdir()
+            if h.is_file() and os.access(h, os.X_OK) and not h.name.endswith(".sample")
+        )
+        if names:
+            risks.append("hooks: %s" % ", ".join(map(_printable, names)))
+    for path in (common / "config", gitdir / "config.worktree"):
+        if not path.is_file():
+            continue
+        items = _git_config_file(path)
+        if items is None:
+            risks.append("couldn't check %s (is git installed?)" % _printable(path))
+            continue
+        keys = sorted(
+            {
+                key
+                for key, value in items
+                if any(fnmatch.fnmatchcase(key, p) for p in DANGEROUS_GIT_KEYS)
+                or (key.startswith("alias.") and value.lstrip().startswith("!"))
+            }
+        )
+        if keys:
+            risks.append("config sets %s" % ", ".join(map(_printable, keys)))
+    return risks
+
+
+def _git_config_file(path):
+    """[(lowercased key, value)] in one config file (includes not followed), or None."""
+    git = shutil.which("git")
+    if not git:
+        return None
+    try:
+        out = subprocess.run(  # noqa: S603 - fixed argv; only reads the file
+            [git, "config", "--file", str(path), "--list", "-z"],
+            env=_git_env(),
+            capture_output=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if out.returncode != 0:
+        return None
+    pairs = []
+    for item in out.stdout.split(b"\0"):
+        if item:
+            key, _, value = item.decode("utf-8", "replace").partition("\n")
+            pairs.append((key.lower(), value))
+    return pairs
+
+
+def audit_git(before):
+    """Check the repositories below ``before.roots`` after the agent exited.
+
+    Moves aside redirect files (GIT_REDIRECTS) that appeared in existing git dirs, and
+    reports git repositories, submodules and worktrees the agent created, with anything in
+    them that would run a program. Returns the findings as lines of text.
+    """
+    findings = []
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for g, present in sorted(before.redirects.items()):
+        for name in GIT_REDIRECTS:
+            path = g / name
+            if name in present or not os.path.lexists(path):
+                continue
+            dest = g / ("keyveil-quarantine-" + stamp)
+            try:
+                dest.mkdir(mode=0o700, exist_ok=True)
+                path.rename(dest / name)
+            except OSError as e:
+                findings.append(
+                    "%s was created inside the sandbox and could NOT be moved aside (%s): "
+                    "delete it before you run git there" % (_printable(path), e.strerror)
+                )
+            else:
+                findings.append(
+                    "%s was created inside the sandbox (it redirects git's config or "
+                    "hooks); moved it to %s" % (_printable(path), _printable(dest / name))
+                )
+    entries, gitdirs = _git_layout(before.roots)
+    reported = set()
+    for entry in entries:
+        if entry in before.entries:
+            continue
+        g = _gitdir_of(entry)
+        reported.add(g)
+        what = "new git repository %s" % _printable(entry.parent)
+        if g is not None and g != entry.resolve():
+            what += " (git dir %s)" % _printable(g)
+        risks = _git_risks(g) if g is not None else []
+        findings.append(what + (": " + "; ".join(risks) if risks else ""))
+    for g in gitdirs:
+        if g in before.redirects or g in reported:
+            continue
+        risks = _git_risks(g)
+        findings.append(
+            "new git dir %s (a submodule or worktree)" % _printable(g)
+            + (": " + "; ".join(risks) if risks else "")
+        )
+    return findings
+
+
 def _tiocsti_possible():
     """True unless the kernel blocks terminal keystroke injection (dev.tty.legacy_tiocsti=0)."""
     try:
@@ -182,7 +510,8 @@ def build(
     port=cfgmod.DEFAULT_PORT,
     bridge_dir=None,
 ):
-    """Return (bwrap argv, removed env var names, warnings). Pure: inspects but never runs.
+    """Return (bwrap argv, removed env var names, warnings). Inspects (and reads git config)
+    but changes nothing.
 
     Unless ``network`` is "host", the argv expects ``run()`` to have prepared
     ``bridge_dir`` (the proxy relay socket, bridge.py and resolv.conf).
@@ -267,20 +596,29 @@ def build(
             warnings.append("writable path does not exist, skipped: %s" % path)
 
     argv += ["--bind", str(project), str(project)]
-    git = project / ".git"
-    if git.is_dir():  # these run code later, outside the sandbox
-        for rel in ("hooks", "config"):
-            if (git / rel).exists():
-                argv += ["--ro-bind", str(git / rel), str(git / rel)]
+    roots = [project, *(home / rel for rel in AGENT_STATE), *(p.resolve() for p in user_rw)]
+    roots = [r for r in roots if r.exists()]
+
+    # Git runs hooks and config-named programs outside the sandbox later, so in every
+    # repository in a writable directory: hooks, config (and the files it includes) and the
+    # files that point git elsewhere are read-only, and the git dirs themselves are pinned
+    # (a mount point can't be renamed), so `mv .git .git.old && mkdir .git` fails.
+    git_ro, git_create, git_pin, git_warnings = _git_protections(
+        [project, *(p.resolve() for p in user_rw if p.is_dir())], roots
+    )
+    warnings += git_warnings
 
     # Every hide goes after every bind: a later mount covers an earlier one, so this is what
     # keeps a hidden path hidden even inside a writable directory (including user hides of a
     # single file such as ~/.claude/.credentials.json). Pin the directories in between.
     hides = [Path(p) for p in hidden]
     hides += [Path(p).expanduser() for p in (*cfg.sandbox_hide, *extra_hide)]
-    roots = [project, *(home / rel for rel in AGENT_STATE), *(p.resolve() for p in user_rw)]
-    for d in _pins([p.resolve() for p in hides if p.exists()], [r for r in roots if r.exists()]):
+    for d in _pins([*(p.resolve() for p in hides if p.exists()), *git_pin], roots):
         argv += ["--bind", str(d), str(d)]
+    for path in git_ro:
+        argv += ["--ro-bind", str(path), str(path)]
+    for path in git_create:
+        argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
     for path in hides:
         if path.is_dir() and not path.is_symlink():
             argv.extend(["--tmpfs", str(path)])

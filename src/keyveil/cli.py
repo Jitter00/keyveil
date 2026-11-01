@@ -240,11 +240,12 @@ def cmd_sandbox(args):
         except (OSError, ValueError) as e:
             raise CLIError("bad routes file %s: %s" % (cfg.routes_file, e)) from e
     network = args.network or cfg.sandbox_network
+    project = args.project or os.getcwd()
     bridge_dir = sandbox.default_bridge_dir()
     try:
         argv, removed, warnings = sandbox.build(
             args.command,
-            project=args.project or os.getcwd(),
+            project=project,
             cfg=cfg,
             extra_rw=args.rw,
             extra_hide=args.hide,
@@ -267,12 +268,30 @@ def cmd_sandbox(args):
             "keyveil sandbox: removed from the environment: %s" % ", ".join(removed),
             file=sys.stderr,
         )
+    git_before = sandbox.snapshot_git([project, *cfg.sandbox_rw, *args.rw])
     sys.stdout.flush()
     sys.stderr.flush()
     try:
         return sandbox.run(argv, network=network, port=cfg.port, bridge_dir=bridge_dir)
     except sandbox.SandboxError as e:
         raise CLIError(str(e)) from e
+    finally:
+        _report_git_audit(sandbox.audit_git(git_before))
+
+
+def _report_git_audit(findings):
+    """Show (and log) what the agent changed in git repositories that could run code."""
+    if not findings:
+        return
+    lines = ["keyveil sandbox: git repositories changed by the agent (check before using git):"]
+    lines += ["  - %s" % f for f in findings]
+    print("\n".join(lines), file=sys.stderr)
+    try:
+        with open(_private_dir(cfgmod.state_dir()) / "keyveil.log", "a", encoding="utf-8") as log:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            log.writelines("%s %s\n" % (stamp, line) for line in lines)
+    except OSError:
+        pass
 
 
 def cmd_init(args):

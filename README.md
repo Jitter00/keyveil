@@ -624,6 +624,10 @@ everything else keeps working:
 - **`git push` over SSH is blocked** because your SSH keys are hidden. Either push from a
   normal terminal, or add `--ssh-agent` for that session (it lets the agent use your SSH
   identities, so only do it when you need it).
+- **The agent can commit, but not change git's settings.** Hooks and `.git/config` are
+  read-only, so `git branch -d`, `git remote add` or `git config` inside the sandbox fail
+  or warn; run those in a normal terminal. Folders that contain a git repository (and the
+  `.git` folders themselves) can't be renamed or deleted while the agent runs.
 - **Secret-looking environment variables are removed** (`*_API_KEY`, `*_TOKEN`, `AWS_*`, …);
   the names are printed when it starts. If a tool really needs one, add `--keep-env NAME`.
 
@@ -631,7 +635,7 @@ everything else keeps working:
 
 | Inside the sandbox | |
 |---|---|
-| The project directory | read-write (`.git/hooks` and `.git/config` read-only: they run code later, outside) |
+| The project directory | read-write, except what git runs later, outside: in every repository in it, the hooks, config (and files it includes or a `core.hooksPath` inside the project) are read-only, and `.git` folders can't be moved or replaced. After the agent exits, keyveil checks them again (see below) |
 | Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write (this includes your subscription login file unless you `--hide` it) |
 | The rest of the filesystem | read-only: your tools work, but `~/.bashrc`, PATH, keyveil's install and config can't be changed |
 | `/run`, `/tmp`, `~/.cache` | private and empty: no Docker/LXD/libvirt/ssh-agent/keyring sockets |
@@ -660,6 +664,19 @@ It doesn't cover:
   point, but see path allowlists above to limit what it can call.
 - **Sending your project's files somewhere**: the agent has network access.
 - **Kernel exploits** that escape Linux namespaces.
+
+**Git check after exit.** When the agent exits, keyveil looks at the git repositories in
+the project (and `--rw` paths) again:
+- a `commondir` or `config.worktree` file that appeared in an existing `.git` folder (it
+  would make git read another folder's config and hooks) is moved into
+  `.git/keyveil-quarantine-<time>/`;
+- new repositories, submodules and worktrees are listed, with any hooks or config settings
+  in them that run a program (`core.fsmonitor`, `core.pager`, `alias.x = !…`, filters, …).
+
+The findings are printed and added to `~/.local/state/keyveil/keyveil.log`. A new repository
+isn't removed (the agent may have made it for you), so check the listed hooks and settings
+before you run git in it. Folders named `node_modules`, `.venv`, `venv` and the like are
+not searched.
 
 **Network modes.** `isolated` (the default) gives the agent its own network namespace with
 internet access through `slirp4netns` and a relay to the keyveil proxy. `none` keeps only the
@@ -694,6 +711,8 @@ need `slirp4netns`.
 | `keyveil: bubblewrap cannot create a sandbox here` | Your system restricts unprivileged user namespaces (for example Ubuntu 24.04's AppArmor setting `kernel.apparmor_restrict_unprivileged_userns`; not tested by the author) | See your distribution's documentation for allowing `bwrap` |
 | `keyveil: refusing to make /home/you writable` | You started the sandbox from your home folder | `cd` into the project folder first |
 | `keyveil: refusing to make … writable …: it contains …` | A `--rw` path (or the project) would expose a hidden or protected path inside it | Pick a narrower directory, e.g. `~/.config/some-tool` instead of `~/.config` |
+| `keyveil sandbox: git repositories changed by the agent (check before using git)` | After exit, keyveil found a new repository, submodule or worktree, or moved aside a file that redirects git ([details](#what-is-inside-and-what-isnt)) | Look at the listed hooks and settings; if the agent didn't need that repository, delete it |
+| `mv`/`rm` of a folder fails with "Device or resource busy" inside the sandbox | The folder contains a git repository or a hidden file, so it is pinned in place | Do it in a normal terminal |
 | A tool inside the sandbox can't find a file | That folder is hidden or read-only | Allow it with `--rw PATH` (writable) — see [Rules of thumb](#rules-of-thumb) |
 
 The log (`~/.local/state/keyveil/keyveil.log`) shows each request's method, path and status,
@@ -726,6 +745,10 @@ Also worth doing, outside keyveil:
 - **Anyone can listen on the proxy's port when keyveil isn't running.** A program running
   as you (outside the sandbox) could bind `127.0.0.1:8787` after `keyveil stop` or an idle
   shutdown and receive what your tools send: prompts and code, but never your keys.
+- **Git while the agent is still running.** The check after exit can't help if you run git
+  in the project from another terminal while the agent is working: a new repository the
+  agent just made could run its hooks then. Git in repositories that existed before the
+  sandbox started is safe, since their hooks and config are read-only.
 - **No client authentication.** Any local, non-browser program can make requests through the
   proxy while it is up — it just can't read the key. Stop it when you're not using it (or set
   `idle_timeout`), use `allow` lists for sensitive routes, and keep the default bind address of

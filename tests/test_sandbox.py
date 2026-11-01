@@ -131,6 +131,123 @@ class BuildTests(SandboxCase):
         for path in (self.home / ".ssh", self.home / "keys/env.age", self.home / "id.txt"):
             self.assertIn(str(path), hidden)
 
+    def test_git_dirs_are_pinned_and_what_runs_code_is_read_only(self):
+        p = self.project
+        for rel, text in {
+            ".git/HEAD": "ref: refs/heads/main\n",
+            # a submodule: its .git is a file pointing into the parent's .git/modules
+            "lib/.git": "gitdir: ../.git/modules/lib\n",
+            ".git/modules/lib/HEAD": "ref: refs/heads/main\n",
+            ".git/modules/lib/config": "[core]\n",
+            ".git/modules/lib/hooks/.keep": "",
+            # a linked worktree (it uses the main git dir's hooks and config)
+            "wt/.git": "gitdir: %s\n" % (p / ".git/worktrees/wt"),
+            ".git/worktrees/wt/HEAD": "ref: refs/heads/wt\n",
+            ".git/worktrees/wt/commondir": "../..\n",
+            ".git/worktrees/wt/gitdir": "%s\n" % (p / "wt/.git"),
+            # a nested repository that has no hooks folder yet
+            "vendor/x/.git/HEAD": "ref: refs/heads/main\n",
+            "vendor/x/.git/config": "[core]\n",
+            # not searched
+            "node_modules/y/.git/config": "[core]\n",
+        }.items():
+            (p / rel).parent.mkdir(parents=True, exist_ok=True)
+            (p / rel).write_text(text)
+        argv, _, _ = self.build()
+        pins = [
+            argv[i + 1] for i, a in enumerate(argv) if a == "--bind" and argv[i + 1] == argv[i + 2]
+        ]
+        ro = [
+            argv[i + 1]
+            for i, a in enumerate(argv)
+            if a == "--ro-bind" and argv[i + 1] == argv[i + 2]
+        ]
+        for rel in (
+            ".git",
+            ".git/modules",
+            ".git/modules/lib",
+            ".git/worktrees",
+            ".git/worktrees/wt",
+            "lib",
+            "wt",
+            "vendor",
+            "vendor/x",
+            "vendor/x/.git",
+        ):
+            self.assertIn(str(p / rel), pins, rel)  # so none of them can be moved aside
+        for rel in (
+            ".git/hooks",
+            ".git/config",
+            "lib/.git",
+            "wt/.git",
+            ".git/modules/lib/hooks",
+            ".git/modules/lib/config",
+            ".git/worktrees/wt/commondir",
+            ".git/worktrees/wt/gitdir",
+            "vendor/x/.git/config",
+        ):
+            self.assertIn(str(p / rel), ro, rel)
+        made = str(p / "vendor/x/.git/hooks")  # created empty and read-only, so none can be added
+        i = argv.index(made)
+        self.assertEqual(argv[i - 1 : i + 3], ["--tmpfs", made, "--remount-ro", made])
+        self.assertNotIn(str(p / ".git/worktrees/wt/hooks"), argv)
+        self.assertFalse(any("node_modules" in a for a in argv))
+        last_pin = max(i for i, a in enumerate(argv) if a == "--bind")
+        self.assertLess(last_pin, argv.index(str(p / ".git/hooks")))  # pins first
+
+    @unittest.skipUnless(shutil.which("git"), "git is required")
+    def test_git_config_hooks_path_and_includes_are_read_only(self):
+        p = self.project
+        for rel in ("objects", "refs"):  # without these and HEAD git ignores the config
+            (p / ".git" / rel).mkdir()
+        (p / ".git/HEAD").write_text("ref: refs/heads/main\n")
+        (p / ".git/config").write_text(
+            "[core]\n\thooksPath = .husky\n[include]\n\tpath = ../shared.gitconfig\n"
+        )
+        (p / ".husky").mkdir()
+        (p / ".husky/pre-commit").write_text("#!/bin/sh\n")
+        (p / "shared.gitconfig").write_text("[user]\n\tname = x\n")
+        argv, _, warnings = self.build()
+        for rel in (".husky", "shared.gitconfig"):
+            i = argv.index(str(p / rel))
+            self.assertEqual(argv[i - 1 : i + 2], ["--ro-bind", *[str(p / rel)] * 2], rel)
+        self.assertEqual(warnings[1:], [])  # [0]: maybe the TIOCSTI note
+        shutil.rmtree(p / ".husky")  # missing: the agent could create it, so say so
+        _, _, warnings = self.build()
+        self.assertTrue(any(str(p / ".husky") in w for w in warnings), warnings)
+
+    def test_symlinked_git_hooks_are_reported(self):
+        hooks = self.project / ".git/hooks"
+        shutil.rmtree(hooks)
+        (self.project / "githooks").mkdir()
+        hooks.symlink_to("../githooks")  # a mount would land on the target, not the link
+        _, _, warnings = self.build()
+        self.assertTrue(any(str(hooks) in w and "symbolic link" in w for w in warnings))
+
+    @unittest.skipUnless(shutil.which("git"), "git is required")
+    def test_git_audit_quarantines_redirects_and_reports_new_repositories(self):
+        before = sandbox.snapshot_git([self.project])
+        (self.project / ".git/commondir").write_text("../elsewhere\n")
+        new = self.project / "sub\x1b[2J"  # an escape sequence must not reach the terminal
+        (new / ".git/hooks").mkdir(parents=True)
+        (new / ".git/HEAD").write_text("ref: refs/heads/main\n")
+        for name in ("post-checkout", "pre-commit.sample"):
+            (new / ".git/hooks" / name).write_text("#!/bin/sh\n")
+            (new / ".git/hooks" / name).chmod(0o755)
+        (new / ".git/config").write_text(
+            "[core]\n\tfsmonitor = x\n[alias]\n\tst = !x\n\tco = checkout\n"
+        )
+        findings = sandbox.audit_git(before)
+        self.assertFalse((self.project / ".git/commondir").exists())
+        self.assertEqual(len(list(self.project.glob(".git/keyveil-quarantine-*/commondir"))), 1)
+        self.assertEqual(len(findings), 2, findings)
+        text = "\n".join(findings)
+        for expected in ("moved it to", "post-checkout", "core.fsmonitor", "alias.st"):
+            self.assertIn(expected, text)
+        for unexpected in ("pre-commit.sample", "alias.co", "\x1b"):
+            self.assertNotIn(unexpected, text)
+        self.assertEqual(sandbox.audit_git(sandbox.snapshot_git([self.project])), [])
+
     def test_secret_environment_is_removed_and_reported(self):
         env = {
             "FOO_API_KEY": "1",
@@ -239,6 +356,7 @@ class LiveTests(SandboxCase):
             text=True,
             timeout=60,
         )
+        self.last = result
         self.assertEqual(result.returncode, 0, result.stderr)
         return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
 
@@ -273,6 +391,47 @@ class LiveTests(SandboxCase):
         self.assertEqual((self.project / "made-inside").read_text(), "ok\n")
         self.assertFalse((self.project / ".git/hooks/pre-commit").exists())
         self.assertTrue((self.home / ".claude/new").exists())
+
+    @unittest.skipUnless(shutil.which("git"), "git is required")
+    def test_git_dir_cant_be_swapped_and_commits_still_work(self):
+        # Audit regression: `mv .git .git.old && mkdir .git` used to plant a hook that ran
+        # on the next `git commit` outside the sandbox.
+        shutil.rmtree(self.project / ".git")
+        for repo in (self.project, self.project / "sub"):
+            subprocess.run(["git", "init", "-q", str(repo)], check=True, env=self.env)
+        out = self.run_inside(
+            r"""
+            echo "commit=$(git commit -qm inside --allow-empty 2>&1 >/dev/null && echo yes)"
+            echo "mvgit=$( (mv .git .git.old) 2>/dev/null && echo yes || echo no)"
+            echo "mvsub=$( (mv sub sub.old) 2>/dev/null && echo yes || echo no)"
+            echo "hooks=$( (rm -rf .git/hooks) 2>/dev/null && echo yes || echo no)"
+            echo "commondir=$( (echo ../x > .git/commondir) 2>/dev/null && echo yes || echo no)"
+            git init -q planted && printf '#!/bin/sh\n' > planted/.git/hooks/pre-commit
+            chmod +x planted/.git/hooks/pre-commit
+        """,
+            env={
+                "GIT_%s_%s" % (r, f): v
+                for r in ("AUTHOR", "COMMITTER")
+                for f, v in (("NAME", "a"), ("EMAIL", "a@b"))
+            },
+        )
+        self.assertEqual(
+            out, {"commit": "yes", "mvgit": "no", "mvsub": "no", "hooks": "no", "commondir": "yes"}
+        )
+        # After exit: the redirect file is moved aside and the planted repository reported.
+        self.assertFalse((self.project / ".git/commondir").exists())
+        for expected in ("moved it to", "planted", "pre-commit"):
+            self.assertIn(expected, self.last.stderr)
+        log = (self.home / ".local/state/keyveil/keyveil.log").read_text()
+        self.assertIn("planted", log)
+        head = subprocess.run(
+            ["git", "-C", str(self.project), "log", "-1", "--format=%s"],
+            env=self.env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertEqual(head.stdout.strip(), "inside")
 
     def test_key_file_inside_the_project_cant_be_read_or_swapped(self):
         # e.g. ~/project/.env.age as the age file: hidden, and its folder pinned so that
