@@ -46,8 +46,10 @@ the repository or anywhere else. All third-party actions are pinned to full comm
 
 ## One-time repository setup (maintainers)
 
-1. **Starting tag.** Before the first automated release, tag the current `main` so earlier,
-   non-conventional history is ignored: `git tag v0.2.0 && git push origin v0.2.0`.
+1. **Starting tag, pushed before `main`.** Pushing `main` starts the release workflow, so the
+   starting tag has to be on GitHub first; without it the release job stops with an error
+   (rather than inventing a first release from the whole history):
+   `git tag v0.2.0 && git push origin v0.2.0 && git push origin main`.
 2. **Merging.** Settings → General → Pull Requests: allow only *squash merging*, default commit
    message *Pull request title*.
 3. **Branch rules.** Settings → Rules → new ruleset for `main`: require a pull request and the
