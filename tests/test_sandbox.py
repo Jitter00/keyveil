@@ -95,16 +95,22 @@ class BuildTests(SandboxCase):
             self.home / ".config/keyveil",  # keyveil's config itself (even if it existed)
             self.home / ".ssh/sub",  # inside a hidden directory
             self.home / ".local",  # contains ~/.local/bin (on PATH)
-            self.home / "keys",  # contains the encrypted key file
         ):
             with self.assertRaises(sandbox.SandboxError, msg=bad):
                 self.build(extra_rw=[str(bad)])
             with self.assertRaises(sandbox.SandboxError, msg=bad):
                 self.build(cfg=dataclasses.replace(self.cfg, sandbox_rw=(bad,)))
-        # The key file inside the project would make the project unsafe too.
-        cfg = dataclasses.replace(self.cfg, age_file=self.project / "keys/env.age")
+        # A key file that doesn't exist yet inside a writable folder: the agent could plant one.
+        cfg = dataclasses.replace(self.cfg, age_file=self.project / "keys/missing.age")
         with self.assertRaises(sandbox.SandboxError):
             self.build(cfg=cfg)
+        # An existing one is fine: hidden after the binds, its parent directories pinned.
+        (self.project / "keys/env.age").write_text("ENCRYPTED\n")
+        cfg = dataclasses.replace(self.cfg, age_file=self.project / "keys/env.age")
+        argv, _, _ = self.build(cfg=cfg)
+        pin = argv.index(str(self.project / "keys"))
+        self.assertEqual(argv[pin - 1 : pin + 2], ["--bind", *[str(self.project / "keys")] * 2])
+        self.build(extra_rw=[str(self.home / "keys")])  # contains the existing key file
         # A harmless sibling is fine.
         (self.home / "cache-dir").mkdir()
         self.build(extra_rw=[str(self.home / "cache-dir")])
@@ -207,9 +213,10 @@ class LiveTests(SandboxCase):
 
     def run_inside(self, script, *extra, env=None, port=8787):
         cfg_file = self.home / ".config/keyveil/config.toml"
+        age_file = getattr(self, "age_file", self.home / "keys/env.age")
         cfg_file.write_text(
             'port = %d\n[age]\nidentity = "%s"\nfile = "%s"\n'
-            % (port, self.home / "id.txt", self.home / "keys/env.age")
+            % (port, self.home / "id.txt", age_file)
         )
         result = subprocess.run(
             [
@@ -266,6 +273,22 @@ class LiveTests(SandboxCase):
         self.assertEqual((self.project / "made-inside").read_text(), "ok\n")
         self.assertFalse((self.project / ".git/hooks/pre-commit").exists())
         self.assertTrue((self.home / ".claude/new").exists())
+
+    def test_key_file_inside_the_project_cant_be_read_or_swapped(self):
+        # e.g. ~/project/.env.age as the age file: hidden, and its folder pinned so that
+        # `mv keys keys.old && mkdir keys` can't put a planted file at the configured path.
+        key = self.project / "keys" / "env.age"
+        key.parent.mkdir()
+        key.write_text("ENCRYPTED\n")
+        self.age_file = key
+        out = self.run_inside(r"""
+            echo "read=$(cat keys/env.age 2>/dev/null)"
+            echo "rm=$( (rm -f keys/env.age) 2>/dev/null && echo yes || echo no)"
+            echo "mvdir=$( (mv keys keys.old) 2>/dev/null && echo yes || echo no)"
+            echo "mvfile=$( (mv keys/env.age x) 2>/dev/null && echo yes || echo no)"
+        """)
+        self.assertEqual(out, {"read": "", "rm": "no", "mvdir": "no", "mvfile": "no"})
+        self.assertEqual(key.read_text(), "ENCRYPTED\n")
 
     def test_refuses_a_writable_parent_of_keyveil_config(self):
         # Audit regression: --rw ~/.config used to re-expose ~/.config/keyveil read-write.

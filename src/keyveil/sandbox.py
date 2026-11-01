@@ -109,30 +109,53 @@ def _secret_env_names(environ, route_env_names, keep):
     return sorted(names)
 
 
-def _check_writable(path, home, protected, what):
+def _check_writable(path, home, hidden, runs_code, what):
     """Raise SandboxError unless ``path`` is safe to make writable for the agent.
 
-    Refused: /, $HOME and its parents, and anything that contains or sits inside a
-    protected path (whether or not that path exists yet: the agent could create it).
+    Refused: /, $HOME and its parents; anything that is or sits inside a hidden or
+    code-running path; anything containing a code-running path, or a hidden path that
+    doesn't exist yet (the agent could create it: a planted key file or keyveil config).
+    An existing hidden path inside it is fine: it is mounted over after the writable binds
+    and its parent directories are pinned (see build()), so it can't be read or replaced.
     """
     path = Path(path).resolve()
     if path == home or path in home.parents:
         raise SandboxError(
             "refusing to make %s writable: pick a directory below your home directory" % path
         )
-    for p in protected:
+    for p, is_hidden in [*((p, True) for p in hidden), *((p, False) for p in runs_code)]:
         p = Path(p).expanduser().resolve()
-        if path == p or path in p.parents or p in path.parents:
-            raise SandboxError(
-                "refusing to make %s writable (%s): it %s %s, which must stay protected. "
-                "Pick a narrower directory."
-                % (
-                    path,
-                    what,
-                    "is" if path == p else "is inside" if p in path.parents else "contains",
-                    p,
-                )
-            )
+        if path == p or p in path.parents:
+            relation = "it is" if path == p else "it is inside"
+        elif path in p.parents and not (is_hidden and p.exists()):
+            relation = "it contains"
+        else:
+            continue
+        missing = (
+            " (which doesn't exist yet, so the agent could create it)" if not p.exists() else ""
+        )
+        raise SandboxError(
+            "refusing to make %s writable (%s): %s %s%s, which must stay protected. "
+            "Pick a narrower directory." % (path, what, relation, p, missing)
+        )
+
+
+def _pins(hides, roots):
+    """Directories to bind onto themselves so no hidden path can be moved aside.
+
+    A mount point can't be renamed or removed, so pinning every directory between a
+    writable root and a hidden path stops `mv dir dir.old && mkdir dir` from swapping the
+    hidden file for one the agent wrote.
+    """
+    pins = []
+    for hide in hides:
+        for root in roots:
+            if root in hide.parents:
+                d = hide.parent
+                while d != root:
+                    pins.append(d)
+                    d = d.parent
+    return sorted(set(pins), key=lambda d: len(d.parts))  # parents first
 
 
 def _tiocsti_possible():
@@ -226,13 +249,13 @@ def build(
         hidden.append(prefix)  # e.g. ~/.local/share/uv/tools/keyveil
     hidden += [p for p in (cfg.age_file, cfg.age_identity) if p]
 
-    # Nothing writable may contain, or sit inside, a hidden path or a file that runs code
-    # later outside the sandbox: a writable parent would let the agent replace it.
-    protected = [*hidden, *(home / rel for rel in RUNS_CODE_LATER)]
-    _check_writable(project, home, protected, what="project directory")
+    # Nothing writable may expose a hidden path or a file that runs code later outside the
+    # sandbox (see _check_writable).
+    runs_code = [home / rel for rel in RUNS_CODE_LATER]
+    _check_writable(project, home, hidden, runs_code, what="project directory")
     user_rw = [Path(p).expanduser() for p in (*cfg.sandbox_rw, *extra_rw)]
     for path in user_rw:
-        _check_writable(path, home, protected, what="writable path")
+        _check_writable(path, home, hidden, runs_code, what="writable path")
 
     if (home / ".cache").is_dir():
         argv += ["--tmpfs", str(home / ".cache")]  # private scratch; nothing persists
@@ -252,9 +275,13 @@ def build(
 
     # Every hide goes after every bind: a later mount covers an earlier one, so this is what
     # keeps a hidden path hidden even inside a writable directory (including user hides of a
-    # single file such as ~/.claude/.credentials.json).
-    for path in (*hidden, *(Path(p).expanduser() for p in (*cfg.sandbox_hide, *extra_hide))):
-        path = Path(path)
+    # single file such as ~/.claude/.credentials.json). Pin the directories in between.
+    hides = [Path(p) for p in hidden]
+    hides += [Path(p).expanduser() for p in (*cfg.sandbox_hide, *extra_hide)]
+    roots = [project, *(home / rel for rel in AGENT_STATE), *(p.resolve() for p in user_rw)]
+    for d in _pins([p.resolve() for p in hides if p.exists()], [r for r in roots if r.exists()]):
+        argv += ["--bind", str(d), str(d)]
+    for path in hides:
         if path.is_dir() and not path.is_symlink():
             argv.extend(["--tmpfs", str(path)])
         elif path.exists():
