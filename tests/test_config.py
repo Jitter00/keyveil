@@ -96,6 +96,24 @@ command = "echo hi"
         with self.assertRaises(config.ConfigError):
             config.load(port=0)
 
+    def test_idle_timeout_is_minutes_converted_to_seconds(self):
+        self.assertEqual(config.load().idle_timeout, 0)
+        self.assertEqual(config.load(self.write("idle_timeout = 2\n")).idle_timeout, 120)
+        self.assertEqual(config.load(self.write("idle_timeout = 0.5\n")).idle_timeout, 30)
+        for bad in ("idle_timeout = -1\n", 'idle_timeout = "10"\n', "idle_timeout = true\n"):
+            with self.assertRaises(config.ConfigError, msg=bad):
+                config.load(self.write(bad))
+
+    def test_sandbox_paths(self):
+        cfg = config.load(self.write('[sandbox]\nrw = ["~/a"]\nhide = ["~/b", "/c"]\n'))
+        self.assertEqual(cfg.sandbox_rw, (self.tmp / "a",))
+        self.assertEqual(cfg.sandbox_hide, (self.tmp / "b", Path("/c")))
+        self.assertEqual(config.load().sandbox_rw, ())
+        for bad in ('[sandbox]\nrw = "~/a"\n', '[sandbox]\nhide = [1]\n', '[sandbox]\nhide = [""]\n',
+                    '[sandbox]\nwritable = []\n', 'sandbox = 1\n'):
+            with self.assertRaises(config.ConfigError, msg=bad):
+                config.load(self.write(bad))
+
     def test_explicit_missing_file_is_an_error_default_is_not(self):
         with self.assertRaises(config.ConfigError):
             config.load(self.tmp / "nope.toml")

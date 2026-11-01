@@ -3,6 +3,7 @@
 
 port = 8787
 # routes_file = "~/.config/keyveil/routes.json"   # extra routes; used automatically if it exists
+# idle_timeout = 120     # minutes without requests before the proxy exits (default 0 = never)
 
 # 1) age / rage, e.g. an age-plugin-yubikey identity
 # [age]
@@ -14,3 +15,8 @@ port = 8787
 #    so treat it as code you trust. When set, [age] is ignored.
 # [decrypt]
 # command = 'gpg -d "$HOME/keys.gpg"'
+
+# `keyveil sandbox -- <agent>`: extra paths for the sandbox (see README)
+# [sandbox]
+# rw = ["~/.npm"]           # also writable (default: the project, ~/.claude, ~/.claude.json)
+# hide = ["~/secrets"]      # also hidden (default: ~/.ssh, ~/.gnupg, keyveil's files, ...)

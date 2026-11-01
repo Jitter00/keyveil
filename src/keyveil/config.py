@@ -13,6 +13,7 @@ TEMPLATE = """\
 
 port = 8787
 # routes_file = "~/.config/keyveil/routes.json"   # extra routes; used automatically if it exists
+# idle_timeout = 120     # minutes without requests before the proxy exits (default 0 = never)
 
 # 1) age / rage, e.g. an age-plugin-yubikey identity
 # [age]
@@ -24,6 +25,11 @@ port = 8787
 #    so treat it as code you trust. When set, [age] is ignored.
 # [decrypt]
 # command = 'gpg -d "$HOME/keys.gpg"'
+
+# `keyveil sandbox -- <agent>`: extra paths for the sandbox (see README)
+# [sandbox]
+# rw = ["~/.npm"]           # also writable (default: the project, ~/.claude, ~/.claude.json)
+# hide = ["~/secrets"]      # also hidden (default: ~/.ssh, ~/.gnupg, keyveil's files, ...)
 """
 
 
@@ -60,12 +66,23 @@ class Config:
     age_identity: Path | None = None
     age_file: Path | None = None
     age_binary: str = "age"
+    idle_timeout: float = 0.0             # seconds; 0 = never
+    sandbox_rw: tuple = ()                # extra writable paths for `keyveil sandbox`
+    sandbox_hide: tuple = ()              # extra hidden paths for `keyveil sandbox`
     source: Path | None = None            # the file this was loaded from, if any
 
 
-_TOP = {"port", "routes_file", "age", "decrypt"}
+_TOP = {"port", "routes_file", "idle_timeout", "age", "decrypt", "sandbox"}
 _AGE = {"identity", "file", "binary"}
 _DECRYPT = {"command"}
+_SANDBOX = {"rw", "hide"}
+
+
+def _path_list(table, key, where):
+    value = table.get(key, [])
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip() for v in value):
+        raise ConfigError("%s: %r must be a list of non-empty strings" % (where, key))
+    return tuple(_path(v) for v in value)
 
 
 def _check_keys(table, allowed, where):
@@ -113,8 +130,14 @@ def load(path=None, *, port=None, decrypt_command=None):
     where = str(path)
     _check_keys(data, _TOP, where)
     age, dec = _table(data, "age", where), _table(data, "decrypt", where)
+    box = _table(data, "sandbox", where)
     _check_keys(age, _AGE, where + " [age]")
     _check_keys(dec, _DECRYPT, where + " [decrypt]")
+    _check_keys(box, _SANDBOX, where + " [sandbox]")
+
+    idle = data.get("idle_timeout", 0)
+    if isinstance(idle, bool) or not isinstance(idle, (int, float)) or idle < 0:
+        raise ConfigError("%s: 'idle_timeout' must be a number of minutes >= 0" % where)
 
     cfg_port = data.get("port", DEFAULT_PORT)
     if isinstance(cfg_port, bool) or not isinstance(cfg_port, int):
@@ -135,5 +158,8 @@ def load(path=None, *, port=None, decrypt_command=None):
         age_file=_path(_string(age, "file", where + " [age]")) or config_dir() / "env.age",
         age_binary=_string(age, "binary", where + " [age]")
         or ("rage" if shutil.which("rage") else "age"),
+        idle_timeout=float(idle) * 60,
+        sandbox_rw=_path_list(box, "rw", where + " [sandbox]"),
+        sandbox_hide=_path_list(box, "hide", where + " [sandbox]"),
         source=source,
     )

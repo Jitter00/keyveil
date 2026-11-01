@@ -23,3 +23,6 @@ build/
 routes.json
 *.swp
 *.swo
+
+# test scratch dirs (tests/test_sandbox.py)
+.sandbox-test-*/

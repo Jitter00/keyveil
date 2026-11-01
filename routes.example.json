@@ -3,7 +3,8 @@
     "netbox": {
       "upstream": "https://netbox.example.com",
       "env": "NETBOX_TOKEN",
-      "auth": "token"
+      "auth": "token",
+      "allow": ["GET /api/*"]
     },
     "internal-api": {
       "upstream": "https://api.internal.example.com",

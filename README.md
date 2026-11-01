@@ -38,7 +38,7 @@ a JSON file.
   environment variables or dotfiles to leak.
 
 It is **not** a fit for anything that is not an HTTP(S) API with a static header credential; see
-[Limitations](#security-notes-and-limitations).
+[Limitations](#limitations).
 
 ## Why not just export the env var and launch the tool?
 
@@ -81,7 +81,13 @@ The details:
 - Clients connect to keyveil over plain `http://` on loopback, which never leaves your machine.
   keyveil always connects to the upstream over `https://`, so the real key only travels
   encrypted. (The one exception is a `http://` upstream on loopback, e.g. a local gateway.)
+- Answers only local, non-browser clients: requests whose `Host` isn't `127.0.0.1:<port>` /
+  `localhost:<port>`, or that carry browser headers (`Origin`, cross-site `Sec-Fetch-Site`),
+  get `403`. This stops web pages you visit (and DNS-rebinding tricks) from using your keys.
 - Drops any credential header the client sent and sets the real one.
+- Checks request framing strictly: bodies up to 64 MiB (`413` above), chunked uploads
+  supported, ambiguous or malformed lengths rejected, `.`/`..` path segments rejected.
+- Optional per-route path allowlists and an idle auto-shutdown (see below).
 - Streams responses chunk by chunk, so SSE / streaming responses work.
 - Verifies upstream TLS certificates.
 - Logs only method, path and status — never headers or bodies.
@@ -137,7 +143,21 @@ file). The file holds only env var **names**, never secrets:
 Put the matching variables (`NETBOX_TOKEN=…`) in the file you encrypt to `.env.age`. Then use
 `http://127.0.0.1:8787/netbox/api/…` with any dummy token. Upstreams must be `https://`;
 plain `http://` is accepted only for loopback (`localhost`, `127.0.0.1`), so a key never
-crosses a network in clear. A bad routes file makes the proxy refuse to start, with a message.
+crosses a network in clear. A bad routes file (including a misspelled key) makes the proxy
+refuse to start, with a message.
+
+**Limit what a route can do** with an optional `allow` list of `"METHOD /path"` patterns
+(`*` is a wildcard, the query string is ignored, `HEAD` counts as `GET`). Anything else gets
+`403`. Without `allow`, every path is permitted.
+
+```json
+"netbox": { "upstream": "https://netbox.example.com", "env": "NETBOX_TOKEN", "auth": "token",
+            "allow": ["GET /api/*"] }
+```
+
+This makes a key read-only through the proxy, or limits an LLM key to inference
+(`["POST /v1/messages", "GET /v1/models*"]`) so nothing using the proxy can reach account,
+file or admin endpoints.
 
 ## Requirements
 
@@ -231,9 +251,12 @@ keyveil start     # touch your YubiKey; prints "ok" when listening
 keyveil status    # exit code 0 if running, 3 if not
 keyveil stop      # the keys vanish with the process; it does not survive a reboot
 keyveil run       # same as start, but in the foreground (Ctrl-C to stop)
+keyveil sandbox -- claude   # run an agent confined (see "Confine your agents")
 ```
 
-`--config FILE` and `--port N` work with every command (handy for a second instance).
+`--config FILE` and `--port N` work with every command (handy for a second instance). To
+have the proxy stop by itself when unused, set `idle_timeout = <minutes>` in `config.toml`
+(requests in progress are never cut off).
 
 Check it (the credential you send is ignored and replaced):
 
@@ -305,25 +328,89 @@ client = Anthropic(base_url="http://127.0.0.1:8787/anthropic", api_key="local-pr
 curl -s http://127.0.0.1:8787/netbox/api/dcim/sites/ -H 'Authorization: Token unused'
 ```
 
-## Security notes and limitations
+## Confine your agents: `keyveil sandbox`
 
-- **No client authentication.** Any process running as you (or any local user, if you
-  change `--host`) can make requests through the proxy while it is up — it just can't
-  read the key. Stop it when you're not using it. Keep the default bind address of
+Editors and agents run as **you**. If an agent is tricked by a prompt injection (a malicious
+README, issue, web page or dependency), it can do anything you can: edit `~/.bashrc` or the
+code your next YubiKey touch unlocks, use `sudo` if it doesn't need a password, or use Docker
+(membership in the `docker`, `lxd` or `libvirt` groups is root-equivalent). Root can read
+any process's memory, including keyveil's.
+
+`keyveil sandbox` runs an agent under [bubblewrap](https://github.com/containers/bubblewrap)
+(the sandbox Flatpak uses; no root or Docker needed) so those paths are closed while
+everything else keeps working:
+
+```bash
+cd ~/projects/my-app
+keyveil sandbox -- claude
+```
+
+| Inside the sandbox | |
+|---|---|
+| The project directory | read-write (`.git/hooks` and `.git/config` read-only: they run code later, outside) |
+| Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write |
+| The rest of the filesystem | read-only: your tools work, but `~/.bashrc`, PATH, keyveil's install and config can't be changed |
+| `/run`, `/tmp`, `~/.cache` | private and empty: no Docker/LXD/libvirt/ssh-agent/keyring sockets |
+| `~/.ssh`, `~/.gnupg`, cloud CLI credentials, browser profiles, shell history, keyveil's config, your encrypted key file and identity | hidden |
+| `sudo`, `su`, setuid programs | can't gain privileges (`no_new_privs`) |
+| Other processes (including keyveil) | invisible (own PID namespace) |
+| Environment variables that look like secrets (`*_API_KEY`, `*_TOKEN`, `AWS_*`, …) | removed; the names are printed |
+| Network | shared: the internet and keyveil on `127.0.0.1` work |
+
+Options: `--project DIR`, `--rw PATH` / `--hide PATH` (or `[sandbox] rw = [...]`, `hide = [...]`
+in `config.toml`), `--keep-env NAME` (e.g. if you pass `ANTHROPIC_AUTH_TOKEN=local-proxy` in the
+environment instead of `settings.json`), `--ssh-agent` (allow `git push` over ssh), and
+`--dry-run` to print the exact `bwrap` command. It refuses to make your whole home directory
+writable.
+
+It doesn't cover:
+- **Editor extensions** (Cline, Continue…): they run inside the editor's own process, so
+  confining them means running the editor's agent side in a container (e.g. VS Code Dev
+  Containers). Not supported by keyveil yet.
+- **Using the proxy**: a confined agent can still make API calls with your keys. That is the
+  point, but see path allowlists above to limit what it can call.
+- **Sending your project's files somewhere**: the agent has network access.
+- **Kernel exploits** that escape Linux namespaces.
+
+Requires `bwrap` (Ubuntu/Debian: `sudo apt install bubblewrap`) and unprivileged user
+namespaces (default on most distributions).
+
+## Threat model
+
+What keyveil protects, assuming an agent on your machine gets prompt-injected:
+
+| Threat | Without keyveil | keyveil alone | keyveil + `keyveil sandbox` |
+|---|---|---|---|
+| Key leaked from disk (backups, sync, git, an extension's config file) | exposed | **protected** | **protected** |
+| Agent reads the key from a file or the environment into its context, logs or chat | exposed (`printenv`, `cat .env`) | **protected** | **protected** |
+| Agent becomes root (passwordless sudo, docker group) and reads keyveil's memory | exposed | exposed | **protected** |
+| Agent edits what runs at your next unlock (config, PATH, shell rc, installed code) | n/a | exposed | **protected** |
+| A web page in your browser uses the proxy | n/a | **blocked** (Host/Origin check) | **blocked** |
+| Any local program spends your key while the proxy runs | exposed | limited (allowlists, idle shutdown) | limited |
+
+Also worth doing, outside keyveil:
+- **Require a password for `sudo`** (remove `NOPASSWD` rules; edit with `sudo visudo`).
+- **Treat `docker`, `lxd` and `libvirt` group membership as root.** The sandbox hides their
+  sockets, but non-sandboxed programs can still use them.
+- Don't run `sudo` scripts that live in directories you (or an agent) can write, e.g.
+  `~/.local/bin`; install them root-owned in `/usr/local/sbin`.
+
+## Limitations
+
+- **No client authentication.** Any local, non-browser program can make requests through the
+  proxy while it is up — it just can't read the key. Stop it when you're not using it (or set
+  `idle_timeout`), use `allow` lists for sensitive routes, and keep the default bind address of
   `127.0.0.1`.
-- Protects against leaking the key via files, environment variables, process listings and
-  agents. It does **not** protect against root, a compromised kernel, or someone who can
-  already use your unlocked YubiKey.
+- It does **not** protect against root (unless agents are sandboxed), a compromised kernel, or
+  someone who can already use your unlocked YubiKey.
 - **Header credentials only.** Keys in the URL/query string, OAuth flows with token refresh,
   request signing (e.g. AWS SigV4) and mutual TLS are not supported.
 - **HTTP(S) only.** No other protocols (SSH, database connections, …), and no WebSocket or
   HTTP/2 upstream features.
-- **Tampering.** A program running as you can't read the key from the proxy, but it could edit
-  what runs when you unlock: the config file (its `[decrypt] command` is run with `/bin/sh`),
-  the installed package, or your shell aliases and PATH. Your hardware-key touch authorizes
-  whatever is there at that moment. Keep those files writable only by you, and be suspicious of
-  a touch prompt you didn't trigger. Running untrusted agents as a different user or in a
-  container closes this gap.
+- **Tampering.** Outside the sandbox, a program running as you could edit what runs when you
+  unlock: the config file (its `[decrypt] command` is run with `/bin/sh`), the installed
+  package, or your shell aliases and PATH. Your hardware-key touch authorizes whatever is there
+  at that moment, so be suspicious of a touch prompt you didn't trigger.
 - `mlockall` needs a sufficient `ulimit -l`; if it fails it is silently skipped.
 - Prompts and responses pass through the proxy's memory but are never logged.
 - If decryption yields none of the expected variables, the proxy exits and logs the variable
@@ -345,10 +432,12 @@ your real setup or a running proxy.
 Layout:
 
 ```
-src/keyveil/cli.py       the `keyveil` command: init, start, stop, status, run
+src/keyveil/cli.py       the `keyveil` command: init, start, stop, status, run, sandbox
 src/keyveil/config.py    config file (TOML) loading and XDG paths
 src/keyveil/proxy.py     the proxy (self-contained, stdlib only)
-tests/                   offline tests for the proxy, config and CLI
+src/keyveil/sandbox.py   builds the bubblewrap command for `keyveil sandbox`
+tests/                   offline tests: proxy, hardening, config, CLI, sandbox (live tests
+                         skip themselves if bubblewrap can't run)
 scripts/smoke-install.sh packaging smoke test (builds and installs the wheel)
 config.example.toml      the config template (same as `keyveil init` writes)
 routes.example.json      template for custom routes

@@ -135,9 +135,12 @@ def cmd_start(args):
 
     secrets = get_secrets(cfg)
     log_path = _private_dir(cfgmod.state_dir()) / "keyveil.log"
-    argv = [sys.executable, "-I", "-m", "keyveil.proxy", "--port", str(port)]
+    argv = [sys.executable, "-I", "-m", "keyveil.proxy"]
     if cfg.routes_file:
         argv += ["--routes", str(cfg.routes_file)]
+    if cfg.idle_timeout:
+        argv += ["--idle-timeout", "%g" % cfg.idle_timeout]
+    argv += ["--port", str(port)]  # last: `stop` and tests match "--port N" at the end
     with open(log_path, "ab") as log:
         offset = log.tell()
         # The keys go to the child's stdin only: never argv, environment, or a file.
@@ -210,8 +213,38 @@ def cmd_run(args):
         except (OSError, ValueError) as e:
             raise CLIError("bad routes file %s: %s" % (cfg.routes_file, e))
     text = sys.stdin.read() if args.stdin else get_secrets(cfg)
-    proxy.serve(text, HOST, cfg.port)
+    proxy.serve(text, HOST, cfg.port, idle_timeout=cfg.idle_timeout)
     return 0
+
+
+def cmd_sandbox(args):
+    from . import proxy, sandbox
+
+    cfg = cfgmod.load(args.config)
+    if cfg.routes_file:                 # so the sandbox strips custom routes' key variables too
+        try:
+            proxy.load_routes_file(cfg.routes_file)
+        except (OSError, ValueError) as e:
+            raise CLIError("bad routes file %s: %s" % (cfg.routes_file, e))
+    try:
+        argv, removed, warnings = sandbox.build(
+            args.command, project=args.project or os.getcwd(), cfg=cfg,
+            extra_rw=args.rw, extra_hide=args.hide, keep_env=args.keep_env,
+            ssh_agent=args.ssh_agent)
+        if args.dry_run:
+            print(sandbox.describe(argv))
+            return 0
+        sandbox.preflight()
+    except sandbox.SandboxError as e:
+        raise CLIError(str(e))
+    for w in warnings:
+        print("keyveil sandbox: %s" % w, file=sys.stderr)
+    if removed:  # names only, never values
+        print("keyveil sandbox: removed from the environment: %s" % ", ".join(removed),
+              file=sys.stderr)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execvp(argv[0], argv)
 
 
 def cmd_init(args):
@@ -270,11 +303,46 @@ def build_parser():
     p.add_argument("--decrypt-cmd", metavar="CMD",
                    help="shell command printing KEY=VALUE lines (overrides the config)")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser(
+        "sandbox", usage="keyveil sandbox [options] -- COMMAND [ARGS...]",
+        help="run an agent (e.g. claude) confined with bubblewrap",
+        description="Run COMMAND so it can edit the project and use the keyveil proxy, but "
+                    "cannot become root, reach Docker, read common secret stores, or tamper "
+                    "with files outside the project. See README, 'Threat model'.")
+    p.add_argument("--config", metavar="FILE",
+                   help="config file (default: ~/.config/keyveil/config.toml)")
+    p.add_argument("--project", metavar="DIR",
+                   help="directory the agent may write (default: the current directory)")
+    p.add_argument("--rw", action="append", default=[], metavar="PATH",
+                   help="also make PATH writable (repeatable)")
+    p.add_argument("--hide", action="append", default=[], metavar="PATH",
+                   help="also hide PATH (repeatable)")
+    p.add_argument("--keep-env", action="append", default=[], metavar="NAME",
+                   help="keep this environment variable even if it looks secret (repeatable)")
+    p.add_argument("--ssh-agent", action="store_true",
+                   help="give the agent your ssh-agent socket (e.g. for git push over ssh)")
+    p.add_argument("--dry-run", action="store_true", help="print the bwrap command and exit")
+    p.add_argument("command", nargs="*", metavar="COMMAND",
+                   help="the agent to run; put it after `--` if it has its own options")
+    p.set_defaults(func=cmd_sandbox)
     return parser
 
 
+def _split_sandbox_command(argv):
+    """`keyveil sandbox [opts] -- cmd args`: everything after the first `--` is the command."""
+    if "sandbox" in argv and "--" in argv[argv.index("sandbox"):]:
+        cut = argv.index("--", argv.index("sandbox"))
+        return argv[:cut], argv[cut + 1:]
+    return argv, None
+
+
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    argv, command = _split_sandbox_command(argv)
     args = build_parser().parse_args(argv)
+    if command is not None:
+        args.command = command
     try:
         return args.func(args)
     except (CLIError, cfgmod.ConfigError) as e:
