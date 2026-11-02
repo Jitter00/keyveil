@@ -38,6 +38,9 @@ from . import config as cfgmod
 NETWORK_MODES = cfgmod.SANDBOX_NETWORKS
 BRIDGE_MOUNT = "/run/keyveil"  # where the relay's directory appears inside the sandbox
 SLIRP_RESOLV = "nameserver 10.0.2.3\n"  # slirp4netns' built-in DNS forwarder
+# With its own network namespace the agent can't reach your display or session bus, so these
+# would only make programs try and fail. --network host keeps them: they still work there.
+DESKTOP_ENV = ("DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS")
 
 # Hidden from the agent if they exist (relative to $HOME). Directories get an empty tmpfs,
 # files are replaced by /dev/null.
@@ -601,6 +604,8 @@ def build(
     # What gets hidden: common secret stores, then keyveil itself (config, log/state, the
     # installed environment, and the key files).
     hidden = [home / rel for rel in HIDDEN_IN_HOME]
+    if network != "host":
+        hidden.append(home / ".Xauthority")  # the display's login cookie; no display to use it on
     hidden += [cfgmod.config_dir(), cfgmod.state_dir()]
     prefix = Path(prefix or sys.prefix).resolve()
     if home in prefix.parents and prefix != project and project not in prefix.parents:
@@ -676,6 +681,10 @@ def build(
     removed = _secret_env_names(environ, route_env, set(keep_env))
     for name in removed:
         argv += ["--unsetenv", name]
+    if network != "host":
+        for name in DESKTOP_ENV:
+            if name in environ and name not in keep_env:
+                argv += ["--unsetenv", name]
 
     if network != "host":  # start the proxy relay inside, then the command
         command = [

@@ -339,6 +339,28 @@ class BuildTests(SandboxCase):
         with self.assertRaises(sandbox.SandboxError):
             self.build(network="bogus")
 
+    def test_desktop_session_is_cleared_unless_the_network_is_shared(self):
+        environ = {name: "x" for name in sandbox.DESKTOP_ENV}
+        cookie = self.home / ".Xauthority"
+        cookie.write_text("cookie\n")
+        bridge = self.root / "bridge"
+
+        def unset(argv):
+            return {argv[i + 1] for i, arg in enumerate(argv) if arg == "--unsetenv"}
+
+        for mode in ("isolated", "none"):
+            argv, removed, _ = self.build(network=mode, bridge_dir=bridge, environ=environ)
+            self.assertEqual(unset(argv), set(sandbox.DESKTOP_ENV), mode)
+            self.assertEqual(removed, [], mode)  # not secrets: nothing to report each session
+            self.assertIn(str(cookie), argv, mode)
+        argv, _, _ = self.build(network="host", environ=environ)
+        self.assertEqual(unset(argv), set())
+        self.assertNotIn(str(cookie), argv)
+        argv, _, _ = self.build(
+            network="none", bridge_dir=bridge, environ=environ, keep_env=("DISPLAY",)
+        )
+        self.assertEqual(unset(argv), set(sandbox.DESKTOP_ENV) - {"DISPLAY"})
+
     def test_relay_interpreter_is_never_a_hidden_one(self):
         venv = self.root / "venv"
         (venv / "bin").mkdir(parents=True)
@@ -694,6 +716,15 @@ PY
             env={"FOO_API_KEY": "secret", "KEEP_TOKEN": "fine"},
         )
         self.assertEqual(out, {"seen": "no", "foo": "unset", "kept": "fine"})
+
+    def test_desktop_session_is_not_visible(self):
+        (self.home / ".Xauthority").write_text("cookie\n")
+        out = self.run_inside(
+            'echo "display=${DISPLAY-unset}"\necho "bus=${DBUS_SESSION_BUS_ADDRESS-unset}"\n'
+            'echo "cookie=$(cat ~/.Xauthority 2>/dev/null)"\n',
+            env={"DISPLAY": ":1", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/run/user/1/bus"},
+        )
+        self.assertEqual(out, {"display": "unset", "bus": "unset", "cookie": ""})
 
     def test_exit_status_is_the_agents(self):
         cfg_file = self.home / ".config/keyveil/config.toml"
