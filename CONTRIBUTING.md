@@ -53,9 +53,11 @@ the repository or anywhere else. All third-party actions are pinned to full comm
 2. **Merging.** Settings → General → Pull Requests: allow only *squash merging*, default commit
    message *Pull request title*.
 3. **Branch rules.** Settings → Rules → new ruleset for `main`: require a pull request and the
-   status checks `lint`, `test`, `smoke` and `conventional-title`; block force pushes.
+   status checks `lint`, `test (3.11)`, `test (3.12)`, `test (3.13)`, `smoke` and
+   `conventional-title`; block force pushes.
    The release job must be able to push its release commit and tag to `main`:
-   - if your ruleset lets you add **GitHub Actions** to its bypass list, do that; or
+   - if your ruleset lets you add **GitHub Actions** to its bypass list, do that (not possible
+     for a repository under a personal account: GitHub rejects it); or
    - create a fine-grained token (or a GitHub App token) limited to this repository with
      *Contents: read and write*, allowed to bypass the ruleset, and save it as the repository
      secret `RELEASE_TOKEN`. The workflow uses it automatically when it exists.
