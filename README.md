@@ -243,14 +243,14 @@ For every request afterwards:
 
 The details:
 
-- Listens on `127.0.0.1` only. Routes are `/<name>/...` → an upstream API
+- Listens on `127.0.0.1` only, and refuses to start on any non-loopback address. Routes are `/<name>/...` → an upstream API
   (`/openai/v1/chat/completions` → `https://api.openai.com/v1/chat/completions`).
 - Clients connect to keyveil over plain `http://` on loopback, which never leaves your machine.
   keyveil always connects to the upstream over `https://`, so the real key only travels
   encrypted. (The one exception is a `http://` upstream on loopback, e.g. a local gateway.)
 - Answers only local, non-browser clients: requests whose `Host` isn't `127.0.0.1:<port>` /
-  `localhost:<port>`, or that carry browser headers (`Origin`, cross-site `Sec-Fetch-Site`),
-  get `403`. This stops web pages you visit (and DNS-rebinding tricks) from using your keys.
+  `localhost:<port>`, or that carry browser headers (`Origin`, `Referer`, cross-site
+  `Sec-Fetch-Site`), get `403`. This stops web pages you visit (and DNS-rebinding tricks) from using your keys.
 - Drops any credential header the client sent and sets the real one.
 - Checks request framing strictly: bodies up to 64 MiB (`413` above), chunked uploads
   supported, ambiguous or malformed lengths rejected, `.`/`..` path segments rejected.
@@ -259,7 +259,8 @@ The details:
 - Verifies upstream TLS certificates.
 - Logs only method, path and status — never headers or bodies.
 - On Linux it calls `mlockall` (key never swapped to disk) and `prctl(PR_SET_DUMPABLE, 0)`
-  (no core dumps; blocks same-user `/proc/<pid>/mem` and `environ` reads).
+  (no core dumps; blocks same-user `/proc/<pid>/mem` and `environ` reads). If either fails,
+  it says so in the log.
 - A route is enabled only if its key is present in the decrypted input.
 
 Built-in routes:
@@ -332,7 +333,9 @@ ones (they start with `nbt_`) need `bearer`.
 
 **Limit what a route can do** with an optional `allow` list of `"METHOD /path"` patterns
 (`*` is a wildcard, the query string is ignored, `HEAD` counts as `GET`). Anything else gets
-`403`. Without `allow`, every path is permitted.
+`403`. Without `allow`, every path is permitted. On a route with an `allow` list, paths the
+upstream might read differently from the list get `400`: a `;`, `//`, or a percent-encoded
+`/`, `\`, `.`, NUL or `%` (`%2f`, `%5c`, `%2e`, `%00`, `%25`) before the query string.
 
 ```json
 "netbox": { "upstream": "https://netbox.example.com", "env": "NETBOX_TOKEN", "auth": "token",
@@ -736,6 +739,8 @@ need `slirp4netns`.
 | The provider says "invalid API key" (401) | The key inside your encrypted file is wrong or expired | "Changing a key later" in the Quick start |
 | `404 unknown route` | The first part of the address isn't a route, or that route's key isn't in the file | Check the spelling (`/anthropic/…`) and that its variable is in the file |
 | `403 forbidden: only local, non-browser clients` | The request came from a browser, or used an address other than `127.0.0.1:<port>` / `localhost:<port>` (including from inside a container) | Point your tool at exactly `http://127.0.0.1:8787` |
+| `400 ambiguous path for a route with an allow list` | The path has `;`, `//` or an encoded `/`, `\`, `.`, NUL or `%` | Send the plain path; if the API really needs one of these, remove that route's `allow` list |
+| `keyveil: refusing to listen on …` | `--host` was not a loopback address | Leave it at `127.0.0.1`; the proxy is only for programs on this machine |
 | `403 path not allowed for this route` | The route has an `allow` list that doesn't include this request | Adjust the route's `allow` list |
 | `keyveil: bubblewrap is not installed` | `bwrap` is missing | `sudo apt install bubblewrap` |
 | `keyveil: slirp4netns is not installed` | The default `isolated` network mode needs it | `sudo apt install slirp4netns`, or use `--network none` (only the keyveil proxy, no internet) |
@@ -800,7 +805,9 @@ Also worth doing, outside keyveil:
   unlock: the config file (its `[decrypt] command` is run with `/bin/sh`), the installed
   package, or your shell aliases and PATH. Your passphrase or key touch authorizes whatever is
   there at that moment, so be suspicious of an unlock prompt you didn't trigger.
-- `mlockall` needs a sufficient `ulimit -l`; if it fails it is silently skipped.
+- `mlockall` needs a sufficient `ulimit -l`. If it fails, the proxy still runs and writes
+  `keyveil: warning: memory not locked …` to the log; raise the limit (e.g. `memlock` in
+  `/etc/security/limits.conf`) to fix it.
 - Prompts and responses pass through the proxy's memory but are never logged.
 - If decryption yields none of the expected variables, the proxy exits and logs the variable
   **names** it found (never values) to `~/.local/state/keyveil/keyveil.log`.

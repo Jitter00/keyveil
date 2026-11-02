@@ -20,6 +20,7 @@ import fnmatch
 import http.client
 import ipaddress
 import json
+import os
 import re
 import signal
 import ssl
@@ -58,6 +59,9 @@ HOP_BY_HOP = {
 STRIP_AUTH = {"authorization", "x-api-key", "api-key"}
 
 KEYS = {}  # route prefix -> real key (filled from stdin, lives only in RAM)
+# On routes with an allow list: ";" (path parameters), "//", and percent-encoded "/", "\",
+# ".", NUL or "%" (double encoding) in the path.
+AMBIGUOUS_PATH = re.compile(r";|//|%(2f|5c|2e|00|25)", re.IGNORECASE)
 ALLOW = {}  # route prefix -> ["METHOD /path-glob", ...]; absent means every path is allowed
 SSL_CTX = ssl.create_default_context()
 MAX_BODY = 64 * 1024 * 1024  # largest request body forwarded (bytes)
@@ -187,14 +191,39 @@ def path_allowed(route, method, rel_path):
 def harden():
     """Keep secrets out of swap and core dumps; block same-user /proc/<pid>/mem reads.
 
-    Linux/glibc only; failures are ignored (the proxy still works, just less hardened).
+    Linux/glibc only. The proxy still works if a step fails, just less hardened: each
+    failure is reported as one warning line on stderr (the log). Returns the warnings.
     """
+    warnings = []
     try:
         libc = ctypes.CDLL("libc.so.6", use_errno=True)
-        libc.prctl(4, 0, 0, 0, 0)  # PR_SET_DUMPABLE = 0
-        libc.mlockall(1 | 2)  # MCL_CURRENT | MCL_FUTURE
-    except Exception:  # noqa: S110 - best effort; the proxy still works without it
-        pass
+    except OSError:
+        warnings.append("not hardened: libc.so.6 not found (not Linux/glibc)")
+    else:
+        if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE = 0
+            warnings.append(
+                "core dumps and same-user memory reads not blocked (prctl: %s)"
+                % os.strerror(ctypes.get_errno())
+            )
+        if libc.mlockall(1 | 2) != 0:  # MCL_CURRENT | MCL_FUTURE
+            warnings.append(
+                "memory not locked, keys could be swapped to disk (mlockall: %s); "
+                "raise the limit shown by `ulimit -l`" % os.strerror(ctypes.get_errno())
+            )
+    for w in warnings:
+        sys.stderr.write("keyveil: warning: %s\n" % w)
+    sys.stderr.flush()
+    return warnings
+
+
+def is_loopback(host):
+    """True for a loopback bind address: 127.0.0.0/8, ::1 or localhost."""
+    if host.strip().lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host.strip("[]")).is_loopback
+    except ValueError:
+        return False
 
 
 def parse_env(text):
@@ -238,15 +267,16 @@ class Handler(BaseHTTPRequestHandler):
         """Only accept requests addressed to the loopback listener by a non-browser client.
 
         Blocks DNS rebinding (foreign Host) and web pages in your browser (they always send
-        Origin and/or Sec-Fetch-Site on cross-site requests; CLI/SDK clients send neither).
+        Origin and/or Sec-Fetch-Site on cross-site requests, and usually Referer; CLI/SDK
+        clients send none of them).
         """
         hosts = self.headers.get_all("Host") or []
         port = self.server.server_address[1]
         allowed = {"127.0.0.1:%d" % port, "localhost:%d" % port, "[::1]:%d" % port}
         if len(hosts) != 1 or hosts[0].strip().lower() not in allowed:
             return False
-        if self.headers.get("Origin") is not None:
-            return False
+        if self.headers.get("Origin") is not None or self.headers.get("Referer") is not None:
+            return False  # browsers send these; CLI and SDK clients don't
         site = self.headers.get("Sec-Fetch-Site")
         return site is None or site.strip().lower() == "none"
 
@@ -318,6 +348,10 @@ class Handler(BaseHTTPRequestHandler):
         segments = unquote(rel.split("?", 1)[0]).replace("\\", "/").split("/")
         if "." in segments or ".." in segments:  # upstream could resolve them past an allowlist
             return self._fail(400, "dot segments are not allowed in the path\n", close=True)
+        if parts[0] in ALLOW and AMBIGUOUS_PATH.search(rel.split("?", 1)[0]):
+            # An allowlist is checked against the path as written; the upstream may read
+            # these differently (path parameters, encoded slashes or dots, empty segments).
+            return self._fail(400, "ambiguous path for a route with an allow list\n", close=True)
         if not path_allowed(parts[0], self.command, rel):
             return self._fail(403, "path not allowed for this route\n", close=True)
         base, _env_name, style = route
@@ -450,6 +484,11 @@ def serve(env_text, host="127.0.0.1", port=8787, idle_timeout=0):
     (0 = never). Exits (SystemExit) if none of the configured routes has a key. Routes must
     already be loaded into ROUTES. Used by ``python -m keyveil.proxy`` and ``keyveil run``.
     """
+    if not is_loopback(host):
+        sys.exit(
+            "keyveil: refusing to listen on %s: the proxy adds your keys to every request, so "
+            "anyone who can reach it can use them. Use 127.0.0.1 (the default)." % host
+        )
     harden()
     env = parse_env(env_text)
     load_keys(env)
