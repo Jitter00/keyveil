@@ -58,7 +58,15 @@ tag_format = "v{version}"
 major_on_zero = false
 allow_zero_version = true
 commit_message = "chore(release): v{version}"
-build_command = ""
+# Runs after the version is stamped; what it stages goes into the release commit. No `uv build`:
+# the build job in release.yml builds from the tag. The action's container has no uv, so it's
+# installed from hash-pinned requirements, because this job can push to main. Chained with &&:
+# otherwise only the last command's failure would stop the release.
+build_command = """
+    python -m pip install --quiet --require-hashes --only-binary :all: -r .github/release/requirements.txt &&
+    python -m uv lock --upgrade-package "$PACKAGE_NAME" &&
+    git add uv.lock
+"""
 
 [tool.semantic_release.branches.main]
 match = "main"
