@@ -650,7 +650,7 @@ everything else keeps working:
 | `sudo`, `su`, setuid programs | can't gain privileges (`no_new_privs`) |
 | Other processes (including keyveil) | invisible (own PID namespace) |
 | Environment variables that look like secrets | removed; the names are printed |
-| Network | its own: the internet works (through `slirp4netns`), and keyveil is at the usual `127.0.0.1:<port>`; nothing else on your `127.0.0.1`, and no abstract Unix sockets (your X11 display, D-Bus, input methods). Services on your other addresses (e.g. your LAN IP) are still reachable |
+| Network | its own: the internet works (through `slirp4netns`), and keyveil is at the usual `127.0.0.1:<port>`; nothing else on your `127.0.0.1`, and no abstract Unix sockets (your X11 display, D-Bus, input methods), so `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY` and `DBUS_SESSION_BUS_ADDRESS` are cleared and `~/.Xauthority` is hidden. Services on your other addresses (e.g. your LAN IP) are still reachable |
 
 Options: `--network isolated|none|host` (or `[sandbox] network = ...`; see below),
 `--project DIR`, `--rw PATH` / `--hide PATH` (or `[sandbox] rw = [...]`, `hide = [...]`
