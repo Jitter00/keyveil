@@ -760,8 +760,35 @@ def _read_child_pid(fd):
             continue
 
 
-def _start_slirp(pid):
+def _wait_for_uid_map(pid, timeout=5.0):
+    """Wait until the sandbox's user namespace has its uid map.
+
+    bwrap reports the child pid as soon as the namespaces exist, but (without setuid) the
+    child writes its own uid map a moment later; slirp4netns joining before that can fail.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            if Path("/proc/%d/uid_map" % pid).read_text().strip():
+                return
+        except OSError:
+            return  # gone: slirp4netns will report it
+        time.sleep(0.01)
+
+
+def _start_slirp(pid, attempts=3):
     """Attach slirp4netns to ``pid``'s network namespace; return (process, exit fd)."""
+    _wait_for_uid_map(pid)
+    for attempt in range(attempts):
+        try:
+            return _try_slirp(pid)
+        except SandboxError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.1 * (attempt + 1))
+
+
+def _try_slirp(pid):
     ready_r, ready_w = os.pipe()
     exit_r, exit_w = os.pipe()  # slirp4netns exits when we close exit_w (or die)
     errors = tempfile.TemporaryFile()
@@ -791,9 +818,10 @@ def _start_slirp(pid):
         slirp.wait()
         errors.seek(0)
         detail = errors.read().decode("utf-8", "replace").strip().splitlines()
+        errors.close()
         raise SandboxError(
             "slirp4netns could not set up the sandbox network (%s)"
-            % (detail[-1] if detail else "exit %s" % slirp.returncode)
+            % ("; ".join(detail[-3:]) if detail else "exit %s" % slirp.returncode)
         )
     errors.close()
     return slirp, exit_w
@@ -827,14 +855,15 @@ def _supervise(argv, network):
             os.write(block_w, b"1")  # network ready: let the command start
         return proc.wait()
     finally:
+        # Kill bwrap before closing the block fd: closing it lets the command start.
+        if proc is not None and proc.poll() is None:
+            proc.kill()
+            proc.wait()
         for fd in fds:
             try:
                 os.close(fd)
             except OSError:
                 pass
-        if proc is not None and proc.poll() is None:
-            proc.kill()
-            proc.wait()
         if slirp is not None:
             process, exit_w = slirp
             os.close(exit_w)

@@ -752,6 +752,8 @@ need `slirp4netns`.
 | `keyveil: refusing to make … writable …: it contains …` | A `--rw` path (or the project) would expose a hidden or protected path inside it | Pick a narrower directory, e.g. `~/.config/some-tool` instead of `~/.config` |
 | `keyveil sandbox: git repositories changed by the agent (check before using git)` | After exit, keyveil found a new repository, submodule or worktree, or moved aside a file that redirects git ([details](#what-is-inside-and-what-isnt)) | Look at the listed hooks and settings; if the agent didn't need that repository, delete it |
 | `mv`/`rm` of a folder fails with "Device or resource busy" inside the sandbox | The folder contains a git repository or a hidden file, so it is pinned in place | Do it in a normal terminal |
+| Copying from Claude Code (or `xclip`/`xsel`) inside the sandbox does nothing | The sandbox can't reach your display: whatever can use the clipboard can also type into your other windows | Select with the mouse while holding Shift, then Ctrl+Shift+C (your terminal copies it, outside the sandbox) |
+| `keyveil: slirp4netns could not set up the sandbox network (…)` | slirp4netns couldn't join the sandbox (keyveil retries a few times first); the agent is not started | Check the message, `ls -l /dev/net/tun`, and that `slirp4netns --version` works |
 | A tool inside the sandbox can't find a file | That folder is hidden or read-only | Allow it with `--rw PATH` (writable) — see [Rules of thumb](#rules-of-thumb) |
 
 The log (`~/.local/state/keyveil/keyveil.log`) shows each request's method, path and status,

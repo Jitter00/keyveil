@@ -459,6 +459,30 @@ class LiveTests(SandboxCase):
         )
         self.assertEqual(head.stdout.strip(), "inside")
 
+    def test_command_never_starts_if_slirp_fails(self):
+        # CI regression: when slirp4netns failed, releasing bwrap's block fd before killing
+        # it let the command start (without a network) for a moment.
+        fake = self.root / "bin"
+        fake.mkdir()
+        tries = self.root / "tries"
+        (fake / "slirp4netns").write_text(
+            '#!/bin/sh\necho x >> "%s"\necho "child failed(1)" >&2\nexit 1\n' % tries
+        )
+        (fake / "slirp4netns").chmod(0o755)
+        marker = self.project / "started"
+        bridge_dir = self.root / "bridge"
+        argv, _, _ = self.build(
+            ["sh", "-c", "touch %s" % shlex.quote(str(marker))],
+            network="isolated",
+            bridge_dir=bridge_dir,
+        )
+        path = "%s:%s" % (fake, os.environ.get("PATH", ""))
+        with mock.patch.dict(os.environ, {"PATH": path}):
+            with self.assertRaisesRegex(sandbox.SandboxError, "child failed"):
+                sandbox.run(argv, network="isolated", port=9, bridge_dir=bridge_dir)
+        self.assertEqual(len(tries.read_text().split()), 3)  # retried before giving up
+        self.assertFalse(marker.exists())
+
     def test_key_file_inside_the_project_cant_be_read_or_swapped(self):
         # e.g. ~/project/.env.age as the age file: hidden, and its folder pinned so that
         # `mv keys keys.old && mkdir keys` can't put a planted file at the configured path.
