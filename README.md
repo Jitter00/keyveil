@@ -243,14 +243,14 @@ For every request afterwards:
 
 The details:
 
-- Listens on `127.0.0.1` only. Routes are `/<name>/...` → an upstream API
+- Listens on `127.0.0.1` only, and refuses to start on any non-loopback address. Routes are `/<name>/...` → an upstream API
   (`/openai/v1/chat/completions` → `https://api.openai.com/v1/chat/completions`).
 - Clients connect to keyveil over plain `http://` on loopback, which never leaves your machine.
   keyveil always connects to the upstream over `https://`, so the real key only travels
   encrypted. (The one exception is a `http://` upstream on loopback, e.g. a local gateway.)
 - Answers only local, non-browser clients: requests whose `Host` isn't `127.0.0.1:<port>` /
-  `localhost:<port>`, or that carry browser headers (`Origin`, cross-site `Sec-Fetch-Site`),
-  get `403`. This stops web pages you visit (and DNS-rebinding tricks) from using your keys.
+  `localhost:<port>`, or that carry browser headers (`Origin`, `Referer`, cross-site
+  `Sec-Fetch-Site`), get `403`. This stops web pages you visit (and DNS-rebinding tricks) from using your keys.
 - Drops any credential header the client sent and sets the real one.
 - Checks request framing strictly: bodies up to 64 MiB (`413` above), chunked uploads
   supported, ambiguous or malformed lengths rejected, `.`/`..` path segments rejected.
@@ -259,7 +259,8 @@ The details:
 - Verifies upstream TLS certificates.
 - Logs only method, path and status — never headers or bodies.
 - On Linux it calls `mlockall` (key never swapped to disk) and `prctl(PR_SET_DUMPABLE, 0)`
-  (no core dumps; blocks same-user `/proc/<pid>/mem` and `environ` reads).
+  (no core dumps; blocks same-user `/proc/<pid>/mem` and `environ` reads). If either fails,
+  it says so in the log.
 - A route is enabled only if its key is present in the decrypted input.
 
 Built-in routes:
@@ -332,7 +333,9 @@ ones (they start with `nbt_`) need `bearer`.
 
 **Limit what a route can do** with an optional `allow` list of `"METHOD /path"` patterns
 (`*` is a wildcard, the query string is ignored, `HEAD` counts as `GET`). Anything else gets
-`403`. Without `allow`, every path is permitted.
+`403`. Without `allow`, every path is permitted. On a route with an `allow` list, paths the
+upstream might read differently from the list get `400`: a `;`, `//`, or a percent-encoded
+`/`, `\`, `.`, NUL or `%` (`%2f`, `%5c`, `%2e`, `%00`, `%25`) before the query string.
 
 ```json
 "netbox": { "upstream": "https://netbox.example.com", "env": "NETBOX_TOKEN", "auth": "token",
@@ -353,7 +356,7 @@ file or admin endpoints.
 - Something to decrypt your keys: [age] or [rage] (a passphrase, or a hardware key via
   [age-plugin-yubikey](https://github.com/str4d/age-plugin-yubikey)), or any command that
   prints `KEY=VALUE` lines — see [Other secret sources](#other-secret-sources)
-- Optional: `bubblewrap` for [`keyveil sandbox`](#confine-your-agents-keyveil-sandbox)
+- Optional: `bubblewrap` and `slirp4netns` for [`keyveil sandbox`](#confine-your-agents-keyveil-sandbox)
 
 ## Setup with a hardware key
 
@@ -624,28 +627,40 @@ everything else keeps working:
 - **`git push` over SSH is blocked** because your SSH keys are hidden. Either push from a
   normal terminal, or add `--ssh-agent` for that session (it lets the agent use your SSH
   identities, so only do it when you need it).
-- **Secret-looking environment variables are removed** (`*_API_KEY`, `*_TOKEN`, `AWS_*`, …);
+- **Change Claude Code's settings, plugins and MCP servers in a normal session.** Inside the
+  sandbox `/config`, `/model` (when it saves a default), installing or updating plugins, and
+  editing `~/.claude/CLAUDE.md` can't be saved, since those files are read-only.
+- **The agent can commit, but not change git's settings.** Hooks and `.git/config` are
+  read-only, so `git branch -d`, `git remote add` or `git config` inside the sandbox fail
+  or warn; run those in a normal terminal. Folders that contain a git repository (and the
+  `.git` folders themselves) can't be renamed or deleted while the agent runs.
+- **Secret-looking environment variables are removed** (`*_KEY`, `*_TOKEN`, `*_PAT`,
+  `*_PASSWORD`, `DATABASE_URL`, `*_DSN`, `AWS_*`, …, in any letter case);
   the names are printed when it starts. If a tool really needs one, add `--keep-env NAME`.
 
 ### What is inside and what isn't
 
 | Inside the sandbox | |
 |---|---|
-| The project directory | read-write (`.git/hooks` and `.git/config` read-only: they run code later, outside) |
-| Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write (this includes your subscription login file unless you `--hide` it) |
+| The project directory | read-write, except what git runs later, outside: in every repository in it, the hooks, config (and files it includes or a `core.hooksPath` inside the project) are read-only, and `.git` folders can't be moved or replaced. After the agent exits, keyveil checks them again (see below) |
+| Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write (this includes your subscription login file unless you `--hide` it), except what makes Claude Code run something later, outside: `settings.json`, `CLAUDE.md`, `plugins`, `commands`, `agents`, `skills`, `hooks`, `output-styles`, `rules` and scripts directly in `~/.claude` are read-only. `backups`, `shell-snapshots`, `session-env` and `downloads` are private, empty copies. Security settings in `~/.claude.json` and the project's `.claude/settings*.json` and `.mcp.json` are checked after exit (see below) |
 | The rest of the filesystem | read-only: your tools work, but `~/.bashrc`, PATH, keyveil's install and config can't be changed |
 | `/run`, `/tmp`, `~/.cache` | private and empty: no Docker/LXD/libvirt/ssh-agent/keyring sockets |
-| `~/.ssh`, `~/.gnupg`, cloud CLI credentials, browser profiles, shell history, keyveil's config, your encrypted key file and identity | hidden |
+| `~/.ssh`, `~/.gnupg`, cloud CLI credentials (`aws`, `gcloud`, `az`, `kubectl`, `gh`, `doctl`, `op`, `rclone`, …), package-registry tokens (`~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, Maven, Gradle), `~/.vault-token`, `~/.terraform.d`, browser and Thunderbird profiles, shell and REPL history, keyveil's config, your encrypted key file and identity | hidden. The list can't cover every tool: `--hide PATH` adds more |
 | `sudo`, `su`, setuid programs | can't gain privileges (`no_new_privs`) |
 | Other processes (including keyveil) | invisible (own PID namespace) |
 | Environment variables that look like secrets | removed; the names are printed |
-| Network | shared: the internet and keyveil on `127.0.0.1` work |
+| Network | its own: the internet works (through `slirp4netns`), and keyveil is at the usual `127.0.0.1:<port>`; nothing else on your `127.0.0.1`, and no abstract Unix sockets (your X11 display, D-Bus, input methods). Services on your other addresses (e.g. your LAN IP) are still reachable |
 
-Options: `--project DIR`, `--rw PATH` / `--hide PATH` (or `[sandbox] rw = [...]`, `hide = [...]`
+Options: `--network isolated|none|host` (or `[sandbox] network = ...`; see below),
+`--project DIR`, `--rw PATH` / `--hide PATH` (or `[sandbox] rw = [...]`, `hide = [...]`
 in `config.toml`), `--keep-env NAME` (keep one variable the sandbox would otherwise remove), `--ssh-agent`,
 and `--dry-run` to print the exact `bwrap` command without running it. `--hide` also works on
 a single file inside a writable folder, e.g. `--hide ~/.claude/.credentials.json`. It refuses
-to make your whole home directory writable. Shortcuts for Claude Code are in
+to make anything writable (the project or a `--rw` path) that is your home directory, contains
+a hidden path or keyveil's own files, or contains files that run code later outside the
+sandbox (`~/.bashrc`, `~/.local/bin`, `~/.config/systemd`, …): e.g. `--rw ~/.config` is
+refused, `--rw ~/.config/some-tool` is fine. Shortcuts for Claude Code are in
 [Claude Code: subscription or API key](#claude-code-subscription-or-api-key).
 
 It doesn't cover:
@@ -657,8 +672,58 @@ It doesn't cover:
 - **Sending your project's files somewhere**: the agent has network access.
 - **Kernel exploits** that escape Linux namespaces.
 
-Requires `bwrap` (Ubuntu/Debian: `sudo apt install bubblewrap`) and unprivileged user
-namespaces (default on most distributions).
+**Claude Code settings check after exit.** keyveil records the security settings in
+`~/.claude.json`, the project's `.claude/settings.json`, `.claude/settings.local.json` and
+`.mcp.json` before the agent starts: MCP servers, hooks, permissions and allowed tools,
+project trust, `env`, `apiKeyHelper`, the status line, plugins. If any of them changed when
+the agent exits, it lists the changes and asks `Restore the settings from before the session?
+[Y/n]`. Restoring puts back only those settings and keeps everything else Claude Code wrote.
+If you approved something yourself during the session (trusting a new folder, "always allow"
+for a tool), answer `n`. Without a terminal it only prints and logs the changes.
+
+**Optional: an early warning when an agent tries.** `contrib/claude-guard-hook.py` is a
+Claude Code `PreToolUse` hook that refuses Edit/Write/NotebookEdit calls on those files, and
+Bash commands that name them, so the agent is told no at once (sandboxed or not). It is not
+a boundary: it can't see what a script or program started by the agent does. Install it
+root-owned so the agent can't change it, and register it in managed settings:
+
+```bash
+sudo install -D -m 755 -o root contrib/claude-guard-hook.py /usr/local/lib/keyveil/claude-guard-hook.py
+sudo mkdir -p /etc/claude-code
+sudo tee /etc/claude-code/managed-settings.json <<'EOF'
+{"hooks": {"PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash", "hooks": [
+  {"type": "command", "command": "/usr/bin/python3 -I /usr/local/lib/keyveil/claude-guard-hook.py"}]}]}}
+EOF
+```
+
+If that file already exists, merge the `hooks` entry into it instead. Adding
+`"allowManagedHooksOnly": true` also stops hooks from user, project and plugin settings,
+and makes Claude Code read the status line only from managed settings. That's stronger, but
+your own hooks and status line stop working.
+
+**Git check after exit.** When the agent exits, keyveil looks at the git repositories in
+the project (and `--rw` paths) again:
+- a `commondir` or `config.worktree` file that appeared in an existing `.git` folder (it
+  would make git read another folder's config and hooks) is moved into
+  `.git/keyveil-quarantine-<time>/`;
+- new repositories, submodules and worktrees are listed, with any hooks or config settings
+  in them that run a program (`core.fsmonitor`, `core.pager`, `alias.x = !…`, filters, …).
+
+The findings are printed and added to `~/.local/state/keyveil/keyveil.log`. A new repository
+isn't removed (the agent may have made it for you), so check the listed hooks and settings
+before you run git in it. Folders named `node_modules`, `.venv`, `venv` and the like are
+not searched.
+
+**Network modes.** `isolated` (the default) gives the agent its own network namespace with
+internet access through `slirp4netns` and a relay to the keyveil proxy. `none` keeps only the
+relay: the agent can use keyveil but nothing else (no internet, so a Claude subscription login
+won't work). `host` shares your network as earlier versions did. Avoid it: the agent can then
+reach every service on your `127.0.0.1` and your X11 display, through which it can type into
+your other windows. A `--network host` session prints a warning.
+
+Requires `bwrap` and `slirp4netns` (Ubuntu/Debian: `sudo apt install bubblewrap slirp4netns`)
+and unprivileged user namespaces (default on most distributions). `--network none` doesn't
+need `slirp4netns`.
 
 ## Troubleshooting
 
@@ -675,10 +740,20 @@ namespaces (default on most distributions).
 | The provider says "invalid API key" (401) | The key inside your encrypted file is wrong or expired | "Changing a key later" in the Quick start |
 | `404 unknown route` | The first part of the address isn't a route, or that route's key isn't in the file | Check the spelling (`/anthropic/…`) and that its variable is in the file |
 | `403 forbidden: only local, non-browser clients` | The request came from a browser, or used an address other than `127.0.0.1:<port>` / `localhost:<port>` (including from inside a container) | Point your tool at exactly `http://127.0.0.1:8787` |
+| `400 ambiguous path for a route with an allow list` | The path has `;`, `//` or an encoded `/`, `\`, `.`, NUL or `%` | Send the plain path; if the API really needs one of these, remove that route's `allow` list |
+| `keyveil: refusing to listen on …` | `--host` was not a loopback address | Leave it at `127.0.0.1`; the proxy is only for programs on this machine |
 | `403 path not allowed for this route` | The route has an `allow` list that doesn't include this request | Adjust the route's `allow` list |
 | `keyveil: bubblewrap is not installed` | `bwrap` is missing | `sudo apt install bubblewrap` |
+| `keyveil: slirp4netns is not installed` | The default `isolated` network mode needs it | `sudo apt install slirp4netns`, or use `--network none` (only the keyveil proxy, no internet) |
+| `keyveil: /dev/net/tun is missing` | You are inside a container or another sandbox without the tun device | Use `--network none` there, or run keyveil sandbox on the host |
 | `keyveil: bubblewrap cannot create a sandbox here` | Your system restricts unprivileged user namespaces (for example Ubuntu 24.04's AppArmor setting `kernel.apparmor_restrict_unprivileged_userns`; not tested by the author) | See your distribution's documentation for allowing `bwrap` |
+| `keyveil: config file … can be changed by other users` (or `routes file`, `encrypted key file`) | keyveil runs what that file says (or decrypts it) when you unlock, so it only trusts files that just you can change | Run the `chmod` (or `chown`) the message suggests. Group-writable is fine when the group is your own private group (the Ubuntu default) |
 | `keyveil: refusing to make /home/you writable` | You started the sandbox from your home folder | `cd` into the project folder first |
+| `keyveil: refusing to make … writable …: it contains …` | A `--rw` path (or the project) would expose a hidden or protected path inside it | Pick a narrower directory, e.g. `~/.config/some-tool` instead of `~/.config` |
+| `keyveil sandbox: git repositories changed by the agent (check before using git)` | After exit, keyveil found a new repository, submodule or worktree, or moved aside a file that redirects git ([details](#what-is-inside-and-what-isnt)) | Look at the listed hooks and settings; if the agent didn't need that repository, delete it |
+| `mv`/`rm` of a folder fails with "Device or resource busy" inside the sandbox | The folder contains a git repository or a hidden file, so it is pinned in place | Do it in a normal terminal |
+| Copying from Claude Code (or `xclip`/`xsel`) inside the sandbox does nothing | The sandbox can't reach your display: whatever can use the clipboard can also type into your other windows | Select with the mouse while holding Shift, then Ctrl+Shift+C (your terminal copies it, outside the sandbox) |
+| `keyveil: slirp4netns could not set up the sandbox network (…)` | slirp4netns couldn't join the sandbox (keyveil retries a few times first); the agent is not started | Check the message, `ls -l /dev/net/tun`, and that `slirp4netns --version` works |
 | A tool inside the sandbox can't find a file | That folder is hidden or read-only | Allow it with `--rw PATH` (writable) — see [Rules of thumb](#rules-of-thumb) |
 
 The log (`~/.local/state/keyveil/keyveil.log`) shows each request's method, path and status,
@@ -696,6 +771,8 @@ What keyveil protects, assuming an agent on your machine gets prompt-injected:
 | Agent edits what runs at your next unlock (config, PATH, shell rc, installed code) | n/a | exposed | **protected** |
 | A web page in your browser uses the proxy | n/a | **blocked** (Host/Origin check) | **blocked** |
 | Any local program spends your key while the proxy runs | exposed | limited (allowlists, idle shutdown) | limited |
+| Agent reaches your desktop (X11 keystroke injection), D-Bus or other local services | n/a | exposed | **protected** (own network namespace) |
+| Agent takes over the proxy's port to answer your other tools | n/a | exposed | **protected** for sandboxed agents; unsandboxed programs still can |
 
 Also worth doing, outside keyveil:
 - **Require a password for `sudo`** (remove `NOPASSWD` rules; edit with `sudo visudo`).
@@ -706,6 +783,18 @@ Also worth doing, outside keyveil:
 
 ## Limitations
 
+- **Anyone can listen on the proxy's port when keyveil isn't running.** A program running
+  as you (outside the sandbox) could bind `127.0.0.1:8787` after `keyveil stop` or an idle
+  shutdown and receive what your tools send: prompts and code, but never your keys.
+- **Claude Code sessions running at the same time.** A Claude Code session you start outside
+  the sandbox while the agent is running reads `~/.claude.json` and the project's
+  `.claude/settings.local.json` as they are, before keyveil's check after exit. Some of
+  Claude Code's other writable files (session transcripts in `~/.claude/projects`, rewind
+  history in `~/.claude/file-history`) can be edited by the agent and are not checked.
+- **Git while the agent is still running.** The check after exit can't help if you run git
+  in the project from another terminal while the agent is working: a new repository the
+  agent just made could run its hooks then. Git in repositories that existed before the
+  sandbox started is safe, since their hooks and config are read-only.
 - **No client authentication.** Any local, non-browser program can make requests through the
   proxy while it is up — it just can't read the key. Stop it when you're not using it (or set
   `idle_timeout`), use `allow` lists for sensitive routes, and keep the default bind address of
@@ -720,7 +809,9 @@ Also worth doing, outside keyveil:
   unlock: the config file (its `[decrypt] command` is run with `/bin/sh`), the installed
   package, or your shell aliases and PATH. Your passphrase or key touch authorizes whatever is
   there at that moment, so be suspicious of an unlock prompt you didn't trigger.
-- `mlockall` needs a sufficient `ulimit -l`; if it fails it is silently skipped.
+- `mlockall` needs a sufficient `ulimit -l`. If it fails, the proxy still runs and writes
+  `keyveil: warning: memory not locked …` to the log; raise the limit (e.g. `memlock` in
+  `/etc/security/limits.conf`) to fix it.
 - Prompts and responses pass through the proxy's memory but are never logged.
 - If decryption yields none of the expected variables, the proxy exits and logs the variable
   **names** it found (never values) to `~/.local/state/keyveil/keyveil.log`.
@@ -751,6 +842,9 @@ src/keyveil/cli.py       the `keyveil` command: init, start, stop, status, run, 
 src/keyveil/config.py    config file (TOML) loading and XDG paths
 src/keyveil/proxy.py     the proxy (self-contained, stdlib only)
 src/keyveil/sandbox.py   builds the bubblewrap command for `keyveil sandbox`
+src/keyveil/bridge.py    the proxy relay inside the sandbox's own network
+src/keyveil/agentstate.py  Claude Code's files: read-only list, settings check after exit
+contrib/                 claude-guard-hook.py: optional Claude Code hook (early warning)
 tests/                   offline tests: proxy, hardening, config, CLI, sandbox (live tests
                          skip themselves if bubblewrap can't run)
 scripts/smoke-install.sh packaging smoke test (builds and installs the wheel)

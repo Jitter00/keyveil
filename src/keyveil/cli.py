@@ -106,6 +106,10 @@ def get_secrets(cfg):
             )
         if not cfg.age_file.is_file():
             raise CLIError("encrypted file not found: %s" % cfg.age_file)
+        try:  # a swapped file could send your traffic to someone else's API account
+            cfgmod.check_trusted_file(cfg.age_file, "encrypted key file")
+        except cfgmod.ConfigError as e:
+            raise CLIError(str(e)) from None
         argv = [cfg.age_binary, "-d", "-i", str(cfg.age_identity), str(cfg.age_file)]
         shell = False
     print(
@@ -231,7 +235,7 @@ def cmd_run(args):
 
 
 def cmd_sandbox(args):
-    from . import proxy, sandbox
+    from . import agentstate, proxy, sandbox
 
     cfg = cfgmod.load(args.config)
     if cfg.routes_file:  # so the sandbox strips custom routes' key variables too
@@ -239,20 +243,32 @@ def cmd_sandbox(args):
             proxy.load_routes_file(cfg.routes_file)
         except (OSError, ValueError) as e:
             raise CLIError("bad routes file %s: %s" % (cfg.routes_file, e)) from e
-    try:
-        argv, removed, warnings = sandbox.build(
+    network = args.network or cfg.sandbox_network
+    project = args.project or os.getcwd()
+    bridge_dir = sandbox.default_bridge_dir()
+
+    def build():
+        return sandbox.build(
             args.command,
-            project=args.project or os.getcwd(),
+            project=project,
             cfg=cfg,
             extra_rw=args.rw,
             extra_hide=args.hide,
             keep_env=args.keep_env,
             ssh_agent=args.ssh_agent,
+            network=network,
+            port=cfg.port,
+            bridge_dir=bridge_dir,
         )
+
+    try:
+        argv, removed, warnings = build()
         if args.dry_run:
-            print(sandbox.describe(argv))
+            print(sandbox.describe(argv, network))
             return 0
-        sandbox.preflight()
+        sandbox.preflight(network)
+        if agentstate.prepare(Path.home()):  # created now, so mounted read-only: build again
+            argv, removed, warnings = build()
     except sandbox.SandboxError as e:
         raise CLIError(str(e)) from e
     for w in warnings:
@@ -262,9 +278,81 @@ def cmd_sandbox(args):
             "keyveil sandbox: removed from the environment: %s" % ", ".join(removed),
             file=sys.stderr,
         )
+    git_before = sandbox.snapshot_git([project, *cfg.sandbox_rw, *args.rw])
+    claude_before = agentstate.snapshot(agentstate.watched_files(Path.home(), project))
+    claude_files_before = agentstate.snapshot_files(project)
     sys.stdout.flush()
     sys.stderr.flush()
-    os.execvp(argv[0], argv)  # noqa: S606 - replace ourselves with bwrap (argv list, no shell)
+    try:
+        return sandbox.run(argv, network=network, port=cfg.port, bridge_dir=bridge_dir)
+    except sandbox.SandboxError as e:
+        raise CLIError(str(e)) from e
+    finally:
+        _report_git_audit(sandbox.audit_git(git_before))
+        _report_claude_files(agentstate.file_changes(claude_files_before, project))
+        _check_agent_settings(agentstate.changes(claude_before))
+
+
+def _report_claude_files(lines):
+    """Show (and log) changed project skills, commands, agents, workflows and hooks."""
+    if not lines:
+        return
+    lines = [
+        "keyveil sandbox: Claude Code files in the project changed by the agent (they can run"
+        " commands when used; check them before using Claude Code outside the sandbox):",
+        *("  - %s" % line for line in lines),
+    ]
+    print("\n".join(lines), file=sys.stderr)
+    _log(lines)
+
+
+def _check_agent_settings(changes):
+    """Show security settings the agent changed in Claude Code's files; offer to undo them."""
+    from . import agentstate
+
+    if not changes:
+        return
+    lines = ["keyveil sandbox: security settings changed during the session:"]
+    lines += ["  - %s" % line for c in changes for line in agentstate.describe(c)]
+    print("\n".join(lines), file=sys.stderr)
+    _log(lines)
+    if not sys.stdin.isatty():
+        print(
+            "keyveil sandbox: not restoring them (no terminal to ask); check them before you "
+            "run Claude Code outside the sandbox",
+            file=sys.stderr,
+        )
+        return
+    try:
+        answer = input("Restore the settings from before the session? [Y/n] ")
+    except EOFError:
+        answer = "n"
+    if answer.strip().lower() in ("", "y", "yes"):
+        for change in changes:
+            agentstate.restore(change)
+        print("keyveil sandbox: restored.", file=sys.stderr)
+        _log(["keyveil sandbox: restored them"])
+    else:
+        _log(["keyveil sandbox: kept them"])
+
+
+def _log(lines):
+    try:
+        with open(_private_dir(cfgmod.state_dir()) / "keyveil.log", "a", encoding="utf-8") as log:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            log.writelines("%s %s\n" % (stamp, line) for line in lines)
+    except OSError:
+        pass
+
+
+def _report_git_audit(findings):
+    """Show (and log) what the agent changed in git repositories that could run code."""
+    if not findings:
+        return
+    lines = ["keyveil sandbox: git repositories changed by the agent (check before using git):"]
+    lines += ["  - %s" % f for f in findings]
+    print("\n".join(lines), file=sys.stderr)
+    _log(lines)
 
 
 def cmd_init(args):
@@ -375,6 +463,12 @@ def build_parser():
         "--ssh-agent",
         action="store_true",
         help="give the agent your ssh-agent socket (e.g. for git push over ssh)",
+    )
+    p.add_argument(
+        "--network",
+        choices=cfgmod.SANDBOX_NETWORKS,
+        help="isolated (default): own network with internet via slirp4netns; none: only the "
+        "keyveil proxy; host: share your network (not isolated, see README)",
     )
     p.add_argument("--dry-run", action="store_true", help="print the bwrap command and exit")
     p.add_argument(

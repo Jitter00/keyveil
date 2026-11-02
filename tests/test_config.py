@@ -144,5 +144,52 @@ command = "echo hi"
         self.assertEqual(example.read_text(encoding="utf-8"), config.TEMPLATE)
 
 
+class TrustedFileTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        self.file = self.dir / "config.toml"
+        self.file.write_text("port = 8787\n")
+
+    def check(self, mode):
+        os.chmod(self.file, mode)
+        config.check_trusted_file(self.file, "config file")
+
+    def test_modes(self):
+        self.check(0o600)
+        self.check(0o644)
+        config.check_trusted_file(self.dir / "missing", "x")  # nothing to check
+        with self.assertRaises(config.ConfigError) as cm:
+            self.check(0o602)
+        self.assertIn("chmod o-w", str(cm.exception))
+        with mock.patch.object(config, "_own_private_group", return_value=False):
+            with self.assertRaises(config.ConfigError) as cm:
+                self.check(0o660)
+            self.assertIn("chmod g-w", str(cm.exception))
+        with mock.patch.object(config, "_own_private_group", return_value=True):
+            self.check(0o664)  # Ubuntu's default: your group has only you in it
+
+    def test_owned_by_someone_else(self):
+        with mock.patch.object(config.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaises(config.ConfigError) as cm:
+                self.check(0o600)
+        self.assertIn("owned by another user", str(cm.exception))
+
+    def test_load_checks_the_config_and_routes_files(self):
+        routes = self.dir / "routes.json"
+        routes.write_text("{}")
+        self.file.write_text('routes_file = "%s"\n' % routes)
+        os.chmod(self.file, 0o600)
+        config.load(self.file)
+        os.chmod(routes, 0o646)  # noqa: S103 - testing that it is refused
+        with self.assertRaises(config.ConfigError) as cm:
+            config.load(self.file)
+        self.assertIn("routes file", str(cm.exception))
+        os.chmod(routes, 0o600)
+        os.chmod(self.file, 0o606)  # noqa: S103 - testing that it is refused
+        with self.assertRaises(config.ConfigError):
+            config.load(self.file)
+
+
 if __name__ == "__main__":
     unittest.main()

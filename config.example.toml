@@ -20,3 +20,4 @@ port = 8787
 # [sandbox]
 # rw = ["~/.npm"]           # also writable (default: the project, ~/.claude, ~/.claude.json)
 # hide = ["~/secrets"]      # also hidden (default: ~/.ssh, ~/.gnupg, keyveil's files, ...)
+# network = "isolated"      # "isolated" (default; needs slirp4netns), "none" or "host"

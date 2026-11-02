@@ -31,6 +31,7 @@ port = 8787
 # [sandbox]
 # rw = ["~/.npm"]           # also writable (default: the project, ~/.claude, ~/.claude.json)
 # hide = ["~/secrets"]      # also hidden (default: ~/.ssh, ~/.gnupg, keyveil's files, ...)
+# network = "isolated"      # "isolated" (default; needs slirp4netns), "none" or "host"
 """
 
 
@@ -70,13 +71,15 @@ class Config:
     idle_timeout: float = 0.0  # seconds; 0 = never
     sandbox_rw: tuple = ()  # extra writable paths for `keyveil sandbox`
     sandbox_hide: tuple = ()  # extra hidden paths for `keyveil sandbox`
+    sandbox_network: str = "isolated"  # `keyveil sandbox` network mode
     source: Path | None = None  # the file this was loaded from, if any
 
 
 _TOP = {"port", "routes_file", "idle_timeout", "age", "decrypt", "sandbox"}
 _AGE = {"identity", "file", "binary"}
 _DECRYPT = {"command"}
-_SANDBOX = {"rw", "hide"}
+_SANDBOX = {"rw", "hide", "network"}
+SANDBOX_NETWORKS = ("isolated", "none", "host")
 
 
 def _path_list(table, key, where):
@@ -109,6 +112,59 @@ def _table(data, key, where):
     return value
 
 
+def _network(table, where):
+    value = table.get("network", "isolated")
+    if value not in SANDBOX_NETWORKS:
+        raise ConfigError(
+            "%s: 'network' must be one of %s" % (where, ", ".join(map(repr, SANDBOX_NETWORKS)))
+        )
+    return value
+
+
+def _own_private_group(gid):
+    """True if ``gid`` is your own user-private group (no one else in it), as Ubuntu and
+    Fedora create by default: then a group-writable file is still writable only by you."""
+    import grp
+    import pwd
+
+    uid = os.getuid()
+    try:
+        me, group = pwd.getpwuid(uid), grp.getgrgid(gid)
+    except KeyError:
+        return False
+    if gid != me.pw_gid or set(group.gr_mem) - {me.pw_name}:
+        return False
+    return not any(u.pw_gid == gid and u.pw_uid != uid for u in pwd.getpwall())
+
+
+def check_trusted_file(path, what):
+    """Raise ConfigError if anyone but you could change ``path`` (keyveil trusts its content).
+
+    Refused: a file owned by another user, world-writable, or group-writable for a group
+    other than your own private group.
+    """
+    path = Path(path)
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return
+    if st.st_uid != os.getuid():
+        raise ConfigError(
+            "%s %s is owned by another user (uid %d); keyveil only trusts files you own. "
+            "Fix: sudo chown %d %s" % (what, path, st.st_uid, os.getuid(), path)
+        )
+    if st.st_mode & 0o002:
+        fix = "o-w"
+    elif st.st_mode & 0o020 and not _own_private_group(st.st_gid):
+        fix = "g-w"
+    else:
+        return
+    raise ConfigError(
+        "%s %s can be changed by other users (mode %o); keyveil only trusts files that "
+        "just you can change. Fix: chmod %s %s" % (what, path, st.st_mode & 0o777, fix, path)
+    )
+
+
 def _path(value):
     return Path(os.path.expanduser(value)) if value else None
 
@@ -123,6 +179,7 @@ def load(path=None, *, port=None, decrypt_command=None):
     data, source = {}, None
     if path.is_file():
         source = path
+        check_trusted_file(path, "config file")
         try:
             data = tomllib.loads(path.read_text(encoding="utf-8"))
         except tomllib.TOMLDecodeError as e:
@@ -152,6 +209,8 @@ def load(path=None, *, port=None, decrypt_command=None):
     routes = _path(_string(data, "routes_file", where))
     if routes is None and (config_dir() / "routes.json").is_file():
         routes = config_dir() / "routes.json"
+    if routes is not None:
+        check_trusted_file(routes, "routes file")
 
     return Config(
         port=final_port,
@@ -164,5 +223,6 @@ def load(path=None, *, port=None, decrypt_command=None):
         idle_timeout=float(idle) * 60,
         sandbox_rw=_path_list(box, "rw", where + " [sandbox]"),
         sandbox_hide=_path_list(box, "hide", where + " [sandbox]"),
+        sandbox_network=_network(box, where + " [sandbox]"),
         source=source,
     )

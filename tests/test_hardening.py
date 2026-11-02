@@ -2,6 +2,7 @@
 idle shutdown. Offline: a fake upstream on loopback, no real keys."""
 
 import http.client
+import io
 import json
 import os
 import socket
@@ -12,6 +13,7 @@ import threading
 import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest import mock
 
 from keyveil import proxy
 
@@ -138,6 +140,7 @@ class GuardedProxyTests(unittest.TestCase):
             ("Sec-Fetch-Site", "cross-site"),
             ("Sec-Fetch-Site", "same-site"),
             ("Sec-Fetch-Site", "same-origin"),
+            ("Referer", "https://evil.example/page"),
         ):
             status, _ = self.request("POST", "/echo/x", [header], body=b"{}")
             self.assertEqual(status, 403, header)
@@ -246,6 +249,22 @@ class GuardedProxyTests(unittest.TestCase):
         ):
             self.assertEqual(self.request("GET", path)[0], 400, path)
         self.assertEqual(self.request("GET", "/rules/v1/models/a..b")[0], 200)  # not a segment
+
+    def test_ambiguous_paths_are_refused_on_allowlisted_routes(self):
+        # The allowlist sees the path as written; an upstream may read these differently.
+        for path in (
+            "/rules/v1/models;x=1/../files",
+            "/rules/v1/models%2f..%2ffiles",
+            "/rules/v1/models%2F%2E%2E%2Ffiles",
+            "/rules/v1/models%5cfiles",
+            "/rules/v1/models%00",
+            "/rules/v1/models%252e%252e/files",
+            "/rules/v1/models//files",
+            "/rules/v1/models/a%2eb",
+        ):
+            self.assertEqual(self.request("GET", path)[0], 400, path)
+        self.assertEqual(self.request("GET", "/rules/v1/models?q=a;b%2f")[0], 200)  # query
+        self.assertEqual(self.request("GET", "/echo/a;b%2fc")[0], 200)  # no allow list
 
     def test_allow_rules_are_validated(self):
         for bad in (["post /x"], ["POST x"], ["POST /a b"], "POST /x", [1], [""]):
@@ -399,6 +418,49 @@ class IdleShutdownTests(unittest.TestCase):
         self.assertEqual((resp.status, json.loads(resp.read())["path"]), (200, "/slow"))
         conn.close()
         self.assertEqual(proc.wait(timeout=5), 0)  # and it still shuts down afterwards
+
+
+class BindAndHardenTests(unittest.TestCase):
+    def test_only_loopback_addresses(self):
+        for host in ("127.0.0.1", "127.1.2.3", "::1", "[::1]", "localhost", "LocalHost"):
+            self.assertTrue(proxy.is_loopback(host), host)
+        for host in ("0.0.0.0", "::", "192.168.1.5", "10.0.0.1", "example.com", ""):  # noqa: S104
+            self.assertFalse(proxy.is_loopback(host), host)
+
+    def test_refuses_to_listen_on_a_non_loopback_address(self):
+        for argv in (["--host", "0.0.0.0"], ["--host", "192.168.1.5", "--port", "1"]):  # noqa: S104
+            result = subprocess.run(
+                [sys.executable, "-m", "keyveil.proxy", *argv],
+                input="ANTHROPIC_API_KEY=x\n",
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 1, argv)
+            self.assertIn("refusing to listen", result.stderr)
+
+    def test_harden_reports_each_failed_step(self):
+        class FailingLibc:
+            def prctl(self, *a):
+                return -1
+
+            def mlockall(self, *a):
+                return -1
+
+        with (
+            mock.patch.object(proxy.ctypes, "CDLL", return_value=FailingLibc()),
+            mock.patch.object(proxy.ctypes, "get_errno", return_value=12),
+            mock.patch.object(proxy.sys, "stderr", io.StringIO()) as err,
+        ):
+            warnings = proxy.harden()
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("ulimit -l", warnings[1])
+        self.assertEqual(err.getvalue().count("keyveil: warning:"), 2)
+        with (
+            mock.patch.object(proxy.ctypes, "CDLL", side_effect=OSError),
+            mock.patch.object(proxy.sys, "stderr", io.StringIO()),
+        ):
+            self.assertEqual(len(proxy.harden()), 1)
 
 
 if __name__ == "__main__":
