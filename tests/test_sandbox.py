@@ -3,6 +3,7 @@ script inside a real sandbox with a throwaway HOME (created inside the repo, not
 because the sandbox replaces /tmp and that would make "hidden" checks pass trivially)."""
 
 import dataclasses
+import json
 import os
 import shlex
 import shutil
@@ -328,7 +329,7 @@ class LiveTests(SandboxCase):
     # anywhere bwrap does; IsolatedNetworkTests covers the default "isolated" mode.
     network = "none"
 
-    def run_inside(self, script, *extra, env=None, port=8787):
+    def run_inside(self, script, *extra, env=None, port=8787, stdin=None):
         cfg_file = self.home / ".config/keyveil/config.toml"
         age_file = getattr(self, "age_file", self.home / "keys/env.age")
         cfg_file.write_text(
@@ -352,6 +353,7 @@ class LiveTests(SandboxCase):
                 script,
             ],  # bash: the probes use /dev/tcp
             env={**self.env, **(env or {})},
+            input=stdin,
             capture_output=True,
             text=True,
             timeout=60,
@@ -472,6 +474,67 @@ class LiveTests(SandboxCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertIn("refusing to make", result.stderr)
 
+    def test_claude_code_config_that_runs_code_is_read_only(self):
+        claude = self.home / ".claude"
+        (claude / "plugins").mkdir()
+        (claude / "statusline.sh").write_text("#!/bin/sh\n")
+        (claude / "backups").mkdir()
+        (claude / "backups/.claude.json.backup.1").write_text("{}\n")
+        out = self.run_inside(r"""
+            c=~/.claude
+            w() { ( : > "$1" ) 2>/dev/null && echo yes || echo no; }
+            echo "settings=$(w $c/settings.json)"
+            echo "plugin=$(w $c/plugins/x)"
+            echo "commands=$(w $c/commands/x.md)"
+            echo "statusline=$(w $c/statusline.sh)"
+            echo "mvsettings=$( (mv $c/settings.json $c/s.old) 2>/dev/null && echo yes || echo no)"
+            echo "projects=$(mkdir -p $c/projects/p && w $c/projects/p/t.jsonl)"
+            echo "backups=$(ls -A $c/backups | wc -l)"
+            echo "backup_write=$(w $c/backups/.claude.json.backup.2)"
+        """)
+        self.assertEqual(
+            out,
+            {
+                "settings": "no",
+                "plugin": "no",
+                "commands": "no",  # created empty and read-only, so none can be added
+                "statusline": "no",
+                "mvsettings": "no",
+                "projects": "yes",
+                "backups": "0",  # a private, empty copy
+                "backup_write": "yes",
+            },
+        )
+        self.assertTrue((claude / "commands").is_dir())
+        self.assertEqual(
+            sorted(p.name for p in (claude / "backups").iterdir()), [".claude.json.backup.1"]
+        )
+
+    def test_changed_claude_settings_are_reported_and_restored(self):
+        cfg = self.home / ".claude.json"
+        cfg.write_text(json.dumps({"numStartups": 1, "projects": {"/p": {"allowedTools": []}}}))
+        script = r"""
+            python3 -I - <<'PY'
+import json, os
+p = os.path.expanduser("~/.claude.json")
+d = json.load(open(p))
+d["numStartups"] = 2
+d["mcpServers"] = {"evil": {"command": "sh"}}
+d["projects"]["/p"]["allowedTools"] = ["Bash"]
+json.dump(d, open(p, "w"))
+PY
+            mkdir -p .claude && echo '{"hooks": {"Stop": []}}' > .claude/settings.local.json
+        """
+        self.run_inside(script, stdin="y\n")
+        self.assertIn("mcpServers", self.last.stderr)
+        self.assertIn("projects./p.allowedTools", self.last.stderr)
+        self.assertIn(".claude/settings.local.json: hooks added", self.last.stderr)
+        self.assertNotIn("numStartups", self.last.stderr)
+        # Without a terminal nothing is restored; the findings are printed and logged.
+        self.assertEqual(json.loads(cfg.read_text())["mcpServers"], {"evil": {"command": "sh"}})
+        log = (self.home / ".local/state/keyveil/keyveil.log").read_text()
+        self.assertIn("mcpServers", log)
+
     def test_hide_works_for_a_file_inside_a_writable_directory(self):
         # e.g. `--hide ~/.claude/.credentials.json` while ~/.claude itself is writable.
         creds = self.home / ".claude" / ".credentials.json"
@@ -479,7 +542,7 @@ class LiveTests(SandboxCase):
         out = self.run_inside(
             r"""
             echo "creds=$(cat ~/.claude/.credentials.json 2>/dev/null)"
-            s=~/.claude/settings.json
+            s=~/.claude/history.jsonl
             echo "sibling=$( (echo x > "$s") 2>/dev/null && echo writable || echo no)"
         """,
             "--hide",

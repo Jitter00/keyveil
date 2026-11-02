@@ -231,7 +231,7 @@ def cmd_run(args):
 
 
 def cmd_sandbox(args):
-    from . import proxy, sandbox
+    from . import agentstate, proxy, sandbox
 
     cfg = cfgmod.load(args.config)
     if cfg.routes_file:  # so the sandbox strips custom routes' key variables too
@@ -242,8 +242,9 @@ def cmd_sandbox(args):
     network = args.network or cfg.sandbox_network
     project = args.project or os.getcwd()
     bridge_dir = sandbox.default_bridge_dir()
-    try:
-        argv, removed, warnings = sandbox.build(
+
+    def build():
+        return sandbox.build(
             args.command,
             project=project,
             cfg=cfg,
@@ -255,10 +256,15 @@ def cmd_sandbox(args):
             port=cfg.port,
             bridge_dir=bridge_dir,
         )
+
+    try:
+        argv, removed, warnings = build()
         if args.dry_run:
             print(sandbox.describe(argv, network))
             return 0
         sandbox.preflight(network)
+        if agentstate.prepare(Path.home()):  # created now, so mounted read-only: build again
+            argv, removed, warnings = build()
     except sandbox.SandboxError as e:
         raise CLIError(str(e)) from e
     for w in warnings:
@@ -269,6 +275,8 @@ def cmd_sandbox(args):
             file=sys.stderr,
         )
     git_before = sandbox.snapshot_git([project, *cfg.sandbox_rw, *args.rw])
+    claude_before = agentstate.snapshot(agentstate.watched_files(Path.home(), project))
+    claude_files_before = agentstate.snapshot_files(project)
     sys.stdout.flush()
     sys.stderr.flush()
     try:
@@ -277,6 +285,60 @@ def cmd_sandbox(args):
         raise CLIError(str(e)) from e
     finally:
         _report_git_audit(sandbox.audit_git(git_before))
+        _report_claude_files(agentstate.file_changes(claude_files_before, project))
+        _check_agent_settings(agentstate.changes(claude_before))
+
+
+def _report_claude_files(lines):
+    """Show (and log) changed project skills, commands, agents, workflows and hooks."""
+    if not lines:
+        return
+    lines = [
+        "keyveil sandbox: Claude Code files in the project changed by the agent (they can run"
+        " commands when used; check them before using Claude Code outside the sandbox):",
+        *("  - %s" % line for line in lines),
+    ]
+    print("\n".join(lines), file=sys.stderr)
+    _log(lines)
+
+
+def _check_agent_settings(changes):
+    """Show security settings the agent changed in Claude Code's files; offer to undo them."""
+    from . import agentstate
+
+    if not changes:
+        return
+    lines = ["keyveil sandbox: security settings changed during the session:"]
+    lines += ["  - %s" % line for c in changes for line in agentstate.describe(c)]
+    print("\n".join(lines), file=sys.stderr)
+    _log(lines)
+    if not sys.stdin.isatty():
+        print(
+            "keyveil sandbox: not restoring them (no terminal to ask); check them before you "
+            "run Claude Code outside the sandbox",
+            file=sys.stderr,
+        )
+        return
+    try:
+        answer = input("Restore the settings from before the session? [Y/n] ")
+    except EOFError:
+        answer = "n"
+    if answer.strip().lower() in ("", "y", "yes"):
+        for change in changes:
+            agentstate.restore(change)
+        print("keyveil sandbox: restored.", file=sys.stderr)
+        _log(["keyveil sandbox: restored them"])
+    else:
+        _log(["keyveil sandbox: kept them"])
+
+
+def _log(lines):
+    try:
+        with open(_private_dir(cfgmod.state_dir()) / "keyveil.log", "a", encoding="utf-8") as log:
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            log.writelines("%s %s\n" % (stamp, line) for line in lines)
+    except OSError:
+        pass
 
 
 def _report_git_audit(findings):
@@ -286,12 +348,7 @@ def _report_git_audit(findings):
     lines = ["keyveil sandbox: git repositories changed by the agent (check before using git):"]
     lines += ["  - %s" % f for f in findings]
     print("\n".join(lines), file=sys.stderr)
-    try:
-        with open(_private_dir(cfgmod.state_dir()) / "keyveil.log", "a", encoding="utf-8") as log:
-            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            log.writelines("%s %s\n" % (stamp, line) for line in lines)
-    except OSError:
-        pass
+    _log(lines)
 
 
 def cmd_init(args):

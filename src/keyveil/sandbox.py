@@ -29,7 +29,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import bridge, proxy
+from . import agentstate, bridge, proxy
 from . import config as cfgmod
 
 # --network modes: own namespace with internet (slirp4netns), own namespace with only the
@@ -619,6 +619,17 @@ def build(
         argv += ["--ro-bind", str(path), str(path)]
     for path in git_create:
         argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
+
+    # Claude Code's files that make a later, unsandboxed session run something (settings
+    # with hooks, plugins, commands, ...) are read-only; directories other sessions read
+    # from (shell snapshots, ~/.claude.json backups, ...) are private. See agentstate.
+    claude_ro, claude_create = agentstate.read_only_paths(home)
+    for path in claude_ro:
+        argv += ["--ro-bind", str(path), str(path)]
+    for path in claude_create:
+        argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
+    for path in agentstate.private_paths(home):
+        argv += ["--tmpfs", str(path)]
     for path in hides:
         if path.is_dir() and not path.is_symlink():
             argv.extend(["--tmpfs", str(path)])

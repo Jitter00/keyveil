@@ -624,6 +624,9 @@ everything else keeps working:
 - **`git push` over SSH is blocked** because your SSH keys are hidden. Either push from a
   normal terminal, or add `--ssh-agent` for that session (it lets the agent use your SSH
   identities, so only do it when you need it).
+- **Change Claude Code's settings, plugins and MCP servers in a normal session.** Inside the
+  sandbox `/config`, `/model` (when it saves a default), installing or updating plugins, and
+  editing `~/.claude/CLAUDE.md` can't be saved, since those files are read-only.
 - **The agent can commit, but not change git's settings.** Hooks and `.git/config` are
   read-only, so `git branch -d`, `git remote add` or `git config` inside the sandbox fail
   or warn; run those in a normal terminal. Folders that contain a git repository (and the
@@ -636,7 +639,7 @@ everything else keeps working:
 | Inside the sandbox | |
 |---|---|
 | The project directory | read-write, except what git runs later, outside: in every repository in it, the hooks, config (and files it includes or a `core.hooksPath` inside the project) are read-only, and `.git` folders can't be moved or replaced. After the agent exits, keyveil checks them again (see below) |
-| Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write (this includes your subscription login file unless you `--hide` it) |
+| Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write (this includes your subscription login file unless you `--hide` it), except what makes Claude Code run something later, outside: `settings.json`, `CLAUDE.md`, `plugins`, `commands`, `agents`, `skills`, `hooks`, `output-styles`, `rules` and scripts directly in `~/.claude` are read-only. `backups`, `shell-snapshots`, `session-env` and `downloads` are private, empty copies. Security settings in `~/.claude.json` and the project's `.claude/settings*.json` and `.mcp.json` are checked after exit (see below) |
 | The rest of the filesystem | read-only: your tools work, but `~/.bashrc`, PATH, keyveil's install and config can't be changed |
 | `/run`, `/tmp`, `~/.cache` | private and empty: no Docker/LXD/libvirt/ssh-agent/keyring sockets |
 | `~/.ssh`, `~/.gnupg`, cloud CLI credentials, browser profiles, shell history, keyveil's config, your encrypted key file and identity | hidden |
@@ -664,6 +667,35 @@ It doesn't cover:
   point, but see path allowlists above to limit what it can call.
 - **Sending your project's files somewhere**: the agent has network access.
 - **Kernel exploits** that escape Linux namespaces.
+
+**Claude Code settings check after exit.** keyveil records the security settings in
+`~/.claude.json`, the project's `.claude/settings.json`, `.claude/settings.local.json` and
+`.mcp.json` before the agent starts: MCP servers, hooks, permissions and allowed tools,
+project trust, `env`, `apiKeyHelper`, the status line, plugins. If any of them changed when
+the agent exits, it lists the changes and asks `Restore the settings from before the session?
+[Y/n]`. Restoring puts back only those settings and keeps everything else Claude Code wrote.
+If you approved something yourself during the session (trusting a new folder, "always allow"
+for a tool), answer `n`. Without a terminal it only prints and logs the changes.
+
+**Optional: an early warning when an agent tries.** `contrib/claude-guard-hook.py` is a
+Claude Code `PreToolUse` hook that refuses Edit/Write/NotebookEdit calls on those files, and
+Bash commands that name them, so the agent is told no at once (sandboxed or not). It is not
+a boundary: it can't see what a script or program started by the agent does. Install it
+root-owned so the agent can't change it, and register it in managed settings:
+
+```bash
+sudo install -D -m 755 -o root contrib/claude-guard-hook.py /usr/local/lib/keyveil/claude-guard-hook.py
+sudo mkdir -p /etc/claude-code
+sudo tee /etc/claude-code/managed-settings.json <<'EOF'
+{"hooks": {"PreToolUse": [{"matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash", "hooks": [
+  {"type": "command", "command": "/usr/bin/python3 -I /usr/local/lib/keyveil/claude-guard-hook.py"}]}]}}
+EOF
+```
+
+If that file already exists, merge the `hooks` entry into it instead. Adding
+`"allowManagedHooksOnly": true` also stops hooks from user, project and plugin settings,
+and makes Claude Code read the status line only from managed settings. That's stronger, but
+your own hooks and status line stop working.
 
 **Git check after exit.** When the agent exits, keyveil looks at the git repositories in
 the project (and `--rw` paths) again:
@@ -745,6 +777,11 @@ Also worth doing, outside keyveil:
 - **Anyone can listen on the proxy's port when keyveil isn't running.** A program running
   as you (outside the sandbox) could bind `127.0.0.1:8787` after `keyveil stop` or an idle
   shutdown and receive what your tools send: prompts and code, but never your keys.
+- **Claude Code sessions running at the same time.** A Claude Code session you start outside
+  the sandbox while the agent is running reads `~/.claude.json` and the project's
+  `.claude/settings.local.json` as they are, before keyveil's check after exit. Some of
+  Claude Code's other writable files (session transcripts in `~/.claude/projects`, rewind
+  history in `~/.claude/file-history`) can be edited by the agent and are not checked.
 - **Git while the agent is still running.** The check after exit can't help if you run git
   in the project from another terminal while the agent is working: a new repository the
   agent just made could run its hooks then. Git in repositories that existed before the
@@ -794,6 +831,9 @@ src/keyveil/cli.py       the `keyveil` command: init, start, stop, status, run, 
 src/keyveil/config.py    config file (TOML) loading and XDG paths
 src/keyveil/proxy.py     the proxy (self-contained, stdlib only)
 src/keyveil/sandbox.py   builds the bubblewrap command for `keyveil sandbox`
+src/keyveil/bridge.py    the proxy relay inside the sandbox's own network
+src/keyveil/agentstate.py  Claude Code's files: read-only list, settings check after exit
+contrib/                 claude-guard-hook.py: optional Claude Code hook (early warning)
 tests/                   offline tests: proxy, hardening, config, CLI, sandbox (live tests
                          skip themselves if bubblewrap can't run)
 scripts/smoke-install.sh packaging smoke test (builds and installs the wheel)
