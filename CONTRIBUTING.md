@@ -33,7 +33,7 @@ Pull requests are **squash-merged**, and the PR title becomes the commit on `mai
 
 1. **checks**: lint, tests on Python 3.11/3.12/3.13, install smoke test.
 2. **release**: python-semantic-release reads the commits since the last tag. If any of them
-   release, it bumps `pyproject.toml`, updates `CHANGELOG.md`, commits `chore(release): vX.Y.Z`,
+   release, it bumps `pyproject.toml` and `uv.lock`, updates `CHANGELOG.md`, commits `chore(release): vX.Y.Z`,
    tags `vX.Y.Z` and creates the GitHub Release. Otherwise everything after this step is skipped.
 3. **build**: builds the sdist and wheel from the tag once, checks their contents
    (`scripts/check-dist.py`), smoke-tests the wheel. Later jobs publish these exact files.
