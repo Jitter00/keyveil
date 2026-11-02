@@ -634,7 +634,8 @@ everything else keeps working:
   read-only, so `git branch -d`, `git remote add` or `git config` inside the sandbox fail
   or warn; run those in a normal terminal. Folders that contain a git repository (and the
   `.git` folders themselves) can't be renamed or deleted while the agent runs.
-- **Secret-looking environment variables are removed** (`*_API_KEY`, `*_TOKEN`, `AWS_*`, …);
+- **Secret-looking environment variables are removed** (`*_KEY`, `*_TOKEN`, `*_PAT`,
+  `*_PASSWORD`, `DATABASE_URL`, `*_DSN`, `AWS_*`, …, in any letter case);
   the names are printed when it starts. If a tool really needs one, add `--keep-env NAME`.
 
 ### What is inside and what isn't
@@ -645,7 +646,7 @@ everything else keeps working:
 | Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write (this includes your subscription login file unless you `--hide` it), except what makes Claude Code run something later, outside: `settings.json`, `CLAUDE.md`, `plugins`, `commands`, `agents`, `skills`, `hooks`, `output-styles`, `rules` and scripts directly in `~/.claude` are read-only. `backups`, `shell-snapshots`, `session-env` and `downloads` are private, empty copies. Security settings in `~/.claude.json` and the project's `.claude/settings*.json` and `.mcp.json` are checked after exit (see below) |
 | The rest of the filesystem | read-only: your tools work, but `~/.bashrc`, PATH, keyveil's install and config can't be changed |
 | `/run`, `/tmp`, `~/.cache` | private and empty: no Docker/LXD/libvirt/ssh-agent/keyring sockets |
-| `~/.ssh`, `~/.gnupg`, cloud CLI credentials, browser profiles, shell history, keyveil's config, your encrypted key file and identity | hidden |
+| `~/.ssh`, `~/.gnupg`, cloud CLI credentials (`aws`, `gcloud`, `az`, `kubectl`, `gh`, `doctl`, `op`, `rclone`, …), package-registry tokens (`~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, Maven, Gradle), `~/.vault-token`, `~/.terraform.d`, browser and Thunderbird profiles, shell and REPL history, keyveil's config, your encrypted key file and identity | hidden. The list can't cover every tool: `--hide PATH` adds more |
 | `sudo`, `su`, setuid programs | can't gain privileges (`no_new_privs`) |
 | Other processes (including keyveil) | invisible (own PID namespace) |
 | Environment variables that look like secrets | removed; the names are printed |
@@ -746,6 +747,7 @@ need `slirp4netns`.
 | `keyveil: slirp4netns is not installed` | The default `isolated` network mode needs it | `sudo apt install slirp4netns`, or use `--network none` (only the keyveil proxy, no internet) |
 | `keyveil: /dev/net/tun is missing` | You are inside a container or another sandbox without the tun device | Use `--network none` there, or run keyveil sandbox on the host |
 | `keyveil: bubblewrap cannot create a sandbox here` | Your system restricts unprivileged user namespaces (for example Ubuntu 24.04's AppArmor setting `kernel.apparmor_restrict_unprivileged_userns`; not tested by the author) | See your distribution's documentation for allowing `bwrap` |
+| `keyveil: config file … can be changed by other users` (or `routes file`, `encrypted key file`) | keyveil runs what that file says (or decrypts it) when you unlock, so it only trusts files that just you can change | Run the `chmod` (or `chown`) the message suggests. Group-writable is fine when the group is your own private group (the Ubuntu default) |
 | `keyveil: refusing to make /home/you writable` | You started the sandbox from your home folder | `cd` into the project folder first |
 | `keyveil: refusing to make … writable …: it contains …` | A `--rw` path (or the project) would expose a hidden or protected path inside it | Pick a narrower directory, e.g. `~/.config/some-tool` instead of `~/.config` |
 | `keyveil sandbox: git repositories changed by the agent (check before using git)` | After exit, keyveil found a new repository, submodule or worktree, or moved aside a file that redirects git ([details](#what-is-inside-and-what-isnt)) | Look at the listed hooks and settings; if the agent didn't need that repository, delete it |

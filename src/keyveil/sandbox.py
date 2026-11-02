@@ -57,10 +57,30 @@ HIDDEN_IN_HOME = (
     ".config/google-chrome",
     ".config/chromium",
     ".config/BraveSoftware",
+    ".config/gh",
+    ".config/hub",
+    ".config/rclone",
+    ".config/doctl",
+    ".config/op",
+    ".npmrc",
+    ".pypirc",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".vault-token",
+    ".terraform.d",
+    ".m2/settings.xml",
+    ".gradle/gradle.properties",
+    ".kaggle",
+    ".thunderbird",
     ".bash_history",
     ".zsh_history",
     ".python_history",
     ".lesshst",
+    ".local/share/fish/fish_history",
+    ".psql_history",
+    ".mysql_history",
+    ".node_repl_history",
+    ".sqlite_history",
 )
 # Writable for the agent if they exist (relative to $HOME): Claude Code's state.
 AGENT_STATE = (".claude", ".claude.json")
@@ -81,10 +101,17 @@ RUNS_CODE_LATER = (
     ".config/environment.d",
     ".local/bin",
 )
-# Environment variables removed before the agent starts (fnmatch, case-sensitive).
+# Environment variables removed before the agent starts (fnmatch on the upper-cased name).
 SECRET_ENV = (
+    "*_KEY",
     "*_API_KEY",
     "*_APIKEY",
+    "*_PAT",
+    "*_CREDENTIALS",
+    "*_PASSPHRASE",
+    "DATABASE_URL",
+    "*_DATABASE_URL",
+    "*_DSN",
     "*_TOKEN",
     "*_SECRET",
     "*_SECRET_*",
@@ -148,7 +175,8 @@ def _secret_env_names(environ, route_env_names, keep):
     for name in environ:
         if name in keep:
             continue
-        if name in route_env_names or any(fnmatch.fnmatchcase(name, p) for p in SECRET_ENV):
+        upper = name.upper()
+        if name in route_env_names or any(fnmatch.fnmatchcase(upper, p) for p in SECRET_ENV):
             names.append(name)
     return sorted(names)
 

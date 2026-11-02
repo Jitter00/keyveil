@@ -280,6 +280,30 @@ class BuildTests(SandboxCase):
         _, removed, _ = self.build(environ=env, keep_env=("GITHUB_TOKEN",))
         self.assertNotIn("GITHUB_TOKEN", removed)
 
+    def test_more_secret_names_matched_in_any_case(self):
+        env = {
+            "openai_api_key": "1",
+            "Stripe_Key": "2",
+            "GITLAB_PAT": "3",
+            "DATABASE_URL": "4",
+            "SENTRY_DSN": "5",
+            "GOOGLE_CREDENTIALS": "6",
+            "GPG_PASSPHRASE": "7",
+            "PATH": "/bin",
+            "KEYBOARD": "x",
+            "TERM": "xterm",
+        }
+        _, removed, _ = self.build(environ=env)
+        self.assertEqual(removed, sorted(set(env) - {"PATH", "KEYBOARD", "TERM"}))
+
+    def test_more_credential_files_are_hidden(self):
+        for rel in (".config/gh/hosts.yml", ".npmrc", ".vault-token", ".psql_history"):
+            (self.home / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.home / rel).write_text("secret\n")
+        argv, _, _ = self.build()
+        for rel in (".config/gh", ".npmrc", ".vault-token", ".psql_history"):
+            self.assertIn(str(self.home / rel), argv, rel)
+
     def test_ssh_agent_requires_a_socket(self):
         with self.assertRaises(sandbox.SandboxError):
             self.build(ssh_agent=True, environ={})

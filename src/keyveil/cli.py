@@ -106,6 +106,10 @@ def get_secrets(cfg):
             )
         if not cfg.age_file.is_file():
             raise CLIError("encrypted file not found: %s" % cfg.age_file)
+        try:  # a swapped file could send your traffic to someone else's API account
+            cfgmod.check_trusted_file(cfg.age_file, "encrypted key file")
+        except cfgmod.ConfigError as e:
+            raise CLIError(str(e)) from None
         argv = [cfg.age_binary, "-d", "-i", str(cfg.age_identity), str(cfg.age_file)]
         shell = False
     print(
