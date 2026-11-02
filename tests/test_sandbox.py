@@ -340,8 +340,48 @@ class BuildTests(SandboxCase):
             self.build(network="bogus")
 
     def test_relay_interpreter_is_never_a_hidden_one(self):
-        hidden = [Path(os.path.realpath(sys.executable)).parent]
-        self.assertEqual(sandbox._bridge_python(hidden), "/usr/bin/python3")
+        venv = self.root / "venv"
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin/python3").write_text("")
+        with mock.patch.object(sandbox.sys, "executable", str(venv / "bin/python3")):
+            self.assertEqual(sandbox._bridge_python([]), str(venv / "bin/python3"))
+            if Path("/usr/bin/python3").is_file():
+                self.assertEqual(sandbox._bridge_python([venv]), "/usr/bin/python3")
+            else:
+                with self.assertRaises(sandbox.SandboxError):
+                    sandbox._bridge_python([venv])
+
+
+@unittest.skipUnless(
+    sys.platform.startswith("linux") and bwrap_works() and shutil.which("unshare"),
+    "unprivileged user namespaces and unshare(1) are required",
+)
+class NetnsOwnerTests(unittest.TestCase):
+    def start(self, *unshare):
+        # unshare(1) execs without forking, so the pid ends up being `sleep` itself.
+        proc = subprocess.Popen([*unshare, "sleep", "30"])
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        for _ in range(200):
+            if Path("/proc/%d/comm" % proc.pid).read_text().strip() == "sleep":
+                return proc.pid
+            threading.Event().wait(0.01)
+        self.fail("unshare didn't start")
+
+    def owner_and_own(self, pid):
+        fd = sandbox._netns_owner(pid)
+        try:
+            return os.fstat(fd).st_ino, os.stat("/proc/%d/ns/user" % pid).st_ino
+        finally:
+            os.close(fd)
+
+    def test_owner_of_the_network_namespace_not_the_process_user_namespace(self):
+        # CI regression: bwrap 0.9 moves its child into a nested user namespace after
+        # creating the network namespace; slirp4netns must join the owner instead.
+        owner, own = self.owner_and_own(self.start("unshare", "-Urn", "unshare", "-U"))
+        self.assertNotEqual(owner, own)
+        owner, own = self.owner_and_own(self.start("unshare", "-Urn"))
+        self.assertEqual(owner, own)
 
 
 @unittest.skipUnless(

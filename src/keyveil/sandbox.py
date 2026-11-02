@@ -16,6 +16,7 @@ keyveil proxy on 127.0.0.1. What it can no longer do:
 """
 
 import dataclasses
+import fcntl
 import fnmatch
 import json
 import os
@@ -760,35 +761,42 @@ def _read_child_pid(fd):
             continue
 
 
-def _wait_for_uid_map(pid, timeout=5.0):
-    """Wait until the sandbox's user namespace has its uid map.
+NS_GET_USERNS = 0xB701  # ioctl on a namespace fd: the user namespace that owns it
 
-    bwrap reports the child pid as soon as the namespaces exist, but (without setuid) the
-    child writes its own uid map a moment later; slirp4netns joining before that can fail.
+
+def _netns_owner(pid):
+    """An fd for the user namespace that owns ``pid``'s network namespace.
+
+    Not necessarily ``/proc/PID/ns/user``: newer bwrap (0.9) moves its child into another
+    user namespace after creating the network namespace, and from there slirp4netns isn't
+    allowed to enter the network namespace (setns(CLONE_NEWNET): EPERM).
     """
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        try:
-            if Path("/proc/%d/uid_map" % pid).read_text().strip():
-                return
-        except OSError:
-            return  # gone: slirp4netns will report it
-        time.sleep(0.01)
+    net = os.open("/proc/%d/ns/net" % pid, os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        return fcntl.ioctl(net, NS_GET_USERNS)
+    finally:
+        os.close(net)
 
 
 def _start_slirp(pid, attempts=3):
     """Attach slirp4netns to ``pid``'s network namespace; return (process, exit fd)."""
-    _wait_for_uid_map(pid)
-    for attempt in range(attempts):
-        try:
-            return _try_slirp(pid)
-        except SandboxError:
-            if attempt == attempts - 1:
-                raise
-            time.sleep(0.1 * (attempt + 1))
+    try:
+        userns = _netns_owner(pid)
+    except OSError as e:
+        raise SandboxError("can't find the sandbox's network namespace (%s)" % e) from e
+    try:
+        for attempt in range(attempts):
+            try:
+                return _try_slirp(pid, userns)
+            except SandboxError:
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(0.1 * (attempt + 1))
+    finally:
+        os.close(userns)
 
 
-def _try_slirp(pid):
+def _try_slirp(pid, userns):
     ready_r, ready_w = os.pipe()
     exit_r, exit_w = os.pipe()  # slirp4netns exits when we close exit_w (or die)
     errors = tempfile.TemporaryFile()
@@ -800,11 +808,11 @@ def _try_slirp(pid):
             "--disable-host-loopback",
             "--ready-fd=%d" % ready_w,
             "--exit-fd=%d" % exit_r,
-            "--userns-path=/proc/%d/ns/user" % pid,
+            "--userns-path=/proc/self/fd/%d" % userns,
             str(pid),
             "tap0",
         ],
-        pass_fds=(ready_w, exit_r),
+        pass_fds=(ready_w, exit_r, userns),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=errors,
