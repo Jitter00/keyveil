@@ -2,6 +2,35 @@
 
 <!-- version list -->
 
+## v0.3.1 (2026-11-02)
+
+### Bug Fixes
+
+- **sandbox**: Clear display and D-Bus variables the sandbox can't reach
+  ([#6](https://github.com/Jitter00/keyveil/pull/6),
+  [`026888a`](https://github.com/Jitter00/keyveil/commit/026888a97fb9689cc04f948e36376b046994c82d))
+
+### Chores
+
+- Sync uv.lock with 0.3.0 ([#2](https://github.com/Jitter00/keyveil/pull/2),
+  [`ad9a432`](https://github.com/Jitter00/keyveil/commit/ad9a43258cc57ee487c10ef2eaace21eb5a108d4))
+
+### Continuous Integration
+
+- Attach release files with gh instead of publish-action
+  ([#4](https://github.com/Jitter00/keyveil/pull/4),
+  [`ca8c058`](https://github.com/Jitter00/keyveil/commit/ca8c0583af224b3435b3a4b71a80872bb2af9422))
+
+- Update uv.lock in the release commit ([#3](https://github.com/Jitter00/keyveil/pull/3),
+  [`de4f85a`](https://github.com/Jitter00/keyveil/commit/de4f85a659dbc5c7db796979322b007815b2aa2b))
+
+### Documentation
+
+- Correct the required check names in the ruleset setup
+  ([#5](https://github.com/Jitter00/keyveil/pull/5),
+  [`076d5f7`](https://github.com/Jitter00/keyveil/commit/076d5f77a017af0836c338f483bfa9a414483e75))
+
+
 ## v0.3.0 (2026-11-02)
 
 ### Bug Fixes
