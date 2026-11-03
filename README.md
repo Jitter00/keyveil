@@ -260,7 +260,8 @@ The details:
 - Logs only method, path and status — never headers or bodies.
 - On Linux it calls `mlockall` (key never swapped to disk) and `prctl(PR_SET_DUMPABLE, 0)`
   (no core dumps; blocks same-user `/proc/<pid>/mem` and `environ` reads). If either fails,
-  it says so in the log.
+  it says so in the log. With a small `ulimit -l` (below 256M) only the memory in use at
+  startup, which holds the keys, is locked; see [Limitations](#limitations).
 - A route is enabled only if its key is present in the decrypted input.
 
 Built-in routes:
@@ -571,6 +572,26 @@ Also: values in a settings file's `env` block override variables set in your she
 have an alias that sets its own `ANTHROPIC_BASE_URL` (say, for another gateway), pass it with
 `--settings` too.
 
+### Other agents: Codex CLI, Gemini CLI
+
+The same two modes exist for OpenAI's Codex CLI and Google's Gemini CLI. The sandbox treats
+their folders (`~/.codex`, `~/.gemini`) like `~/.claude`: writable, with the files that make a
+later run execute something read-only (see the [table](#what-is-inside-and-what-isnt)). With
+their own login the agent can read its login file, as with `claude-box`; routed through
+keyveil, hide it:
+
+```bash
+codex-box()        { keyveil sandbox -- codex "$@"; }
+codex-proxy-box()  { OPENAI_BASE_URL=http://127.0.0.1:8787/openai/v1 OPENAI_API_KEY=local-proxy keyveil sandbox --keep-env OPENAI_API_KEY --hide "$HOME/.codex/auth.json" -- codex "$@"; }
+gemini-box()       { keyveil sandbox -- gemini "$@"; }
+```
+
+`codex-proxy-box` needs `OPENAI_API_KEY` in your encrypted file. (`OPENAI_API_KEY` looks like
+a secret, so the sandbox would strip it: `--keep-env` keeps the placeholder.) Gemini's own API
+isn't a built-in route; add one in `routes.json` (`"gemini": {"upstream":
+"https://generativelanguage.googleapis.com", "env": "GEMINI_API_KEY", "auth": "header:x-goog-api-key"}`)
+and point the CLI at it the same way, hiding `~/.gemini/oauth_creds.json`.
+
 ## Confine your agents: `keyveil sandbox`
 
 Editors and agents run as **you**. If an agent is tricked by a prompt injection (a malicious
@@ -618,6 +639,11 @@ everything else keeps working:
   keyveil's own files are hidden on purpose, so the command isn't available there.
 - **Start it from inside the project folder**, never from your home folder (keyveil refuses).
   The agent can change everything in that folder, so keep secrets out of it.
+- **Read-only still means readable.** Apart from the hidden paths listed below, the agent can
+  read every file in your home (other projects' `.env` files, tool configs, notes) and it has
+  internet access, so it can send them anywhere. The hidden list is a safety net, not a wall:
+  keep secrets out of your home where you can, and hide the rest with `--hide PATH` (or
+  `[sandbox] hide = [...]` in `config.toml`).
 - **Anything outside the project is read-only** for the agent: it can't edit other projects,
   `~/.bashrc` or installed programs, and global installs (`pip install --user`, `npm -g`)
   fail. Use a project-local virtual environment instead.
@@ -635,7 +661,7 @@ everything else keeps working:
   or warn; run those in a normal terminal. Folders that contain a git repository (and the
   `.git` folders themselves) can't be renamed or deleted while the agent runs.
 - **Secret-looking environment variables are removed** (`*_KEY`, `*_TOKEN`, `*_PAT`,
-  `*_PASSWORD`, `DATABASE_URL`, `*_DSN`, `AWS_*`, …, in any letter case);
+  `*PASSWORD*`, `*_PWD`, `*_AUTH`, `DATABASE_URL`, `*_DSN`, `AWS_*`, …, in any letter case);
   the names are printed when it starts. If a tool really needs one, add `--keep-env NAME`.
 
 ### What is inside and what isn't
@@ -643,11 +669,12 @@ everything else keeps working:
 | Inside the sandbox | |
 |---|---|
 | The project directory | read-write, except what git runs later, outside: in every repository in it, the hooks, config (and files it includes or a `core.hooksPath` inside the project) are read-only, and `.git` folders can't be moved or replaced. After the agent exits, keyveil checks them again (see below) |
-| Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write (this includes your subscription login file unless you `--hide` it), except what makes Claude Code run something later, outside: `settings.json`, `CLAUDE.md`, `plugins`, `commands`, `agents`, `skills`, `hooks`, `output-styles`, `rules` and scripts directly in `~/.claude` are read-only. `backups`, `shell-snapshots`, `session-env` and `downloads` are private, empty copies. Security settings in `~/.claude.json` and the project's `.claude/settings*.json` and `.mcp.json` are checked after exit (see below) |
-| The rest of the filesystem | read-only: your tools work, but `~/.bashrc`, PATH, keyveil's install and config can't be changed |
+| Agent state: Claude Code (`~/.claude`, `~/.claude.json`), Codex CLI (`~/.codex`, or `$CODEX_HOME` inside your home), Gemini CLI (`~/.gemini`) | read-write (this includes the agent's login file, `~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.gemini/oauth_creds.json`, unless you `--hide` it), except what makes the agent run something later, outside, which is read-only: for Claude `settings.json`, `CLAUDE.md`, `plugins`, `commands`, `agents`, `skills`, `hooks`, `output-styles`, `rules`; for Codex `config.toml` and `*.config.toml` profiles, `hooks.json`, `AGENTS.md`, `memories`, `skills`, `prompts`, `plugins`, `agents`, `rules`, `hooks`; for Gemini `settings.json`, `GEMINI.md`, `trustedFolders.json`, `.env`, `commands`, `extensions`, `skills`, `agents`, `hooks`, `policies`; plus scripts directly in a state folder. Claude's `backups`, `shell-snapshots`, `session-env` and `downloads` are private, empty copies. Security settings in `~/.claude.json` and the project's `.claude/settings*.json` and `.mcp.json` are checked after exit, and changes to the project's `.claude/{skills,commands,agents,workflows,hooks}`, `.codex/{config.toml,hooks.json}` and `.gemini/{settings.json,commands}` are reported (see below) |
+| The rest of the filesystem | read-only, but **readable**: your tools work, `~/.bashrc`, PATH, keyveil's install and config can't be changed, and anything not hidden (other projects, their `.env` files, tool configs) can be read and sent over the network |
 | `/run`, `/tmp`, `~/.cache` | private and empty: no Docker/LXD/libvirt/ssh-agent/keyring sockets |
-| `~/.ssh`, `~/.gnupg`, cloud CLI credentials (`aws`, `gcloud`, `az`, `kubectl`, `gh`, `doctl`, `op`, `rclone`, …), package-registry tokens (`~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, Maven, Gradle), `~/.vault-token`, `~/.terraform.d`, browser and Thunderbird profiles, shell and REPL history, keyveil's config, your encrypted key file and identity | hidden. The list can't cover every tool: `--hide PATH` adds more |
+| `~/.ssh`, `~/.gnupg`, cloud CLI credentials (`aws`, `gcloud`, `az`, `kubectl`, `gh`, `doctl`, `op`, `rclone`, …), package-registry tokens (`~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, Maven, Gradle), git and container-registry logins (`~/.git-credentials`, `~/.config/git/credentials`, `~/.config/containers/auth.json`), editor extensions' key stores (Copilot, Cline, Continue), `~/.vault-token`, `~/.terraform.d`, `~/.fly`, `~/.config/configstore`, browser and Thunderbird profiles, shell, editor and REPL history, keyveil's config, your encrypted key file and identity | hidden. The list can't cover every tool: `--hide PATH` adds more |
 | `sudo`, `su`, setuid programs | can't gain privileges (`no_new_privs`) |
+| Nested user namespaces (`unshare -U`, Chromium's sandbox, rootless podman) | blocked with bubblewrap 0.8+ (`--disable-userns`): they are the usual first step of a namespace-escape exploit. `--allow-userns` (or `[sandbox] userns = true`) turns them back on for agents that drive a browser |
 | Other processes (including keyveil) | invisible (own PID namespace) |
 | Environment variables that look like secrets | removed; the names are printed |
 | Network | its own: the internet works (through `slirp4netns`), and keyveil is at the usual `127.0.0.1:<port>`; nothing else on your `127.0.0.1`, and no abstract Unix sockets (your X11 display, D-Bus, input methods), so `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY` and `DBUS_SESSION_BUS_ADDRESS` are cleared and `~/.Xauthority` is hidden. Services on your other addresses (e.g. your LAN IP) are still reachable |
@@ -655,6 +682,7 @@ everything else keeps working:
 Options: `--network isolated|none|host` (or `[sandbox] network = ...`; see below),
 `--project DIR`, `--rw PATH` / `--hide PATH` (or `[sandbox] rw = [...]`, `hide = [...]`
 in `config.toml`), `--keep-env NAME` (keep one variable the sandbox would otherwise remove), `--ssh-agent`,
+`--allow-userns` (or `[sandbox] userns = true`; see the table above),
 and `--dry-run` to print the exact `bwrap` command without running it. `--hide` also works on
 a single file inside a writable folder, e.g. `--hide ~/.claude/.credentials.json`. It refuses
 to make anything writable (the project or a `--rw` path) that is your home directory, contains
@@ -670,7 +698,8 @@ It doesn't cover:
 - **Using the proxy**: a confined agent can still make API calls with your keys. That is the
   point, but see path allowlists above to limit what it can call.
 - **Sending your project's files somewhere**: the agent has network access.
-- **Kernel exploits** that escape Linux namespaces.
+- **Kernel exploits** that escape Linux namespaces (blocking nested user namespaces removes
+  the most common entry point, but not all of them).
 
 **Claude Code settings check after exit.** keyveil records the security settings in
 `~/.claude.json`, the project's `.claude/settings.json`, `.claude/settings.local.json` and
@@ -809,9 +838,15 @@ Also worth doing, outside keyveil:
   unlock: the config file (its `[decrypt] command` is run with `/bin/sh`), the installed
   package, or your shell aliases and PATH. Your passphrase or key touch authorizes whatever is
   there at that moment, so be suspicious of an unlock prompt you didn't trigger.
-- `mlockall` needs a sufficient `ulimit -l`. If it fails, the proxy still runs and writes
-  `keyveil: warning: memory not locked …` to the log; raise the limit (e.g. `memlock` in
-  `/etc/security/limits.conf`) to fix it.
+- **Memory locking depends on `ulimit -l`.** With at least 256M (or `unlimited`), everything
+  the proxy allocates is locked and can never be swapped. Below that, only the memory in use
+  when the keys are loaded is locked, and the log says `only the memory in use at startup is
+  locked`: the keys stay in RAM, but a later copy made while handling a request could in
+  principle reach swap. (Locking every future allocation under a small limit would make the
+  kernel refuse new threads, so the proxy would stop answering.) If locking fails altogether
+  the proxy still runs and logs `memory not locked`. To raise the limit, set `memlock` in
+  `/etc/security/limits.conf` (or `DefaultLimitMEMLOCK` in `/etc/systemd/user.conf`), then
+  log in again.
 - Prompts and responses pass through the proxy's memory but are never logged.
 - If decryption yields none of the expected variables, the proxy exits and logs the variable
   **names** it found (never values) to `~/.local/state/keyveil/keyveil.log`.

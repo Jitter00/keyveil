@@ -5,11 +5,13 @@ keyveil proxy on 127.0.0.1. What it can no longer do:
   * become root: no_new_privs blocks sudo/su/pkexec and setuid binaries;
   * reach Docker / LXD / libvirt / ssh-agent / the desktop keyring: /run and /tmp are private;
   * tamper with what runs outside the sandbox: everything except the project and the agent's
-    own state is read-only (~/.bashrc, PATH, keyveil's install and config, ...). In the
-    project's git repositories the hooks, config and git dirs can't be changed or swapped,
-    and they are checked again after the agent exits;
+    own state (Claude Code, Codex CLI, Gemini CLI) is read-only (~/.bashrc, PATH, keyveil's
+    install and config, ...). In the project's git repositories the hooks, config and git
+    dirs can't be changed or swapped, and they are checked again after the agent exits;
   * read common secret stores (~/.ssh, ~/.gnupg, cloud CLI credentials, browser profiles...);
   * see or signal other processes (own PID namespace), including the keyveil proxy;
+  * create user namespaces (bwrap 0.8+, unless --allow-userns), the usual first step of a
+    namespace-escape exploit;
   * reach anything on the host's loopback or abstract Unix sockets (X11, D-Bus, ibus...):
     the agent gets its own network namespace. slirp4netns gives it the internet, and a
     relay gives it the keyveil proxy at the usual 127.0.0.1:<port>, and nothing else.
@@ -20,6 +22,7 @@ import fcntl
 import fnmatch
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -85,9 +88,21 @@ HIDDEN_IN_HOME = (
     ".mysql_history",
     ".node_repl_history",
     ".sqlite_history",
+    ".irb_history",
+    ".local/share/zsh/history",
+    ".config/fish/fish_variables",  # `set -U` variables, often tokens
+    ".viminfo",  # command and search history, registers
+    ".local/share/nvim/shada",
+    ".ipython/profile_default/history.sqlite",
+    ".config/git/credentials",  # git-credential-store's XDG location
+    ".config/containers/auth.json",  # podman / skopeo registry logins
+    ".config/github-copilot",  # editor extension's OAuth tokens (hosts.json)
+    ".cline",  # editor extension; data/secrets.json holds API keys in clear
+    ".continue/.env",  # editor extension's API keys
+    ".config/configstore",  # npm-style token stores of many CLIs
+    ".fly",
+    ".config/hcloud",
 )
-# Writable for the agent if they exist (relative to $HOME): Claude Code's state.
-AGENT_STATE = (".claude", ".claude.json")
 # Run code later, outside the sandbox (relative to $HOME). Read-only like the rest of $HOME;
 # listed so that no writable path (--rw, the project) can contain them.
 RUNS_CODE_LATER = (
@@ -121,7 +136,15 @@ SECRET_ENV = (
     "*_SECRET_*",
     "*SECRET_KEY*",
     "*_PASSWORD",
+    "*PASSWORD*",
     "*_PASSWD",
+    "*_PWD",
+    "PGPASSWORD",
+    "MYSQL_PWD",
+    "*_AUTH",
+    "*_PRIVATE_KEY*",
+    "*_ACCESS_KEY*",
+    "*_WEBHOOK_URL",
     "AWS_*",
     "AZURE_*",
     "GOOGLE_APPLICATION_CREDENTIALS",
@@ -172,6 +195,32 @@ DANGEROUS_GIT_KEYS = (
 
 class SandboxError(Exception):
     """A problem that prevents starting the sandbox; the message is shown to the user."""
+
+
+_BWRAP_VERSION = None
+
+
+def bwrap_version():
+    """bubblewrap's version as a tuple, (0, 0, 0) if it can't be found. Cached."""
+    global _BWRAP_VERSION
+    if _BWRAP_VERSION is None:
+        _BWRAP_VERSION = (0, 0, 0)
+        try:
+            out = subprocess.run(  # noqa: S603 - fixed argv
+                ["bwrap", "--version"],  # noqa: S607 - bwrap from PATH
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
+            found = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
+            if found:
+                _BWRAP_VERSION = tuple(int(n) for n in found.groups())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return _BWRAP_VERSION
+
+
+DISABLE_USERNS_SINCE = (0, 8, 0)  # bwrap --disable-userns
 
 
 def _secret_env_names(environ, route_env_names, keep):
@@ -541,9 +590,11 @@ def build(
     network="isolated",
     port=cfgmod.DEFAULT_PORT,
     bridge_dir=None,
+    userns=None,
 ):
     """Return (bwrap argv, removed env var names, warnings). Inspects (and reads git config)
-    but changes nothing.
+    but changes nothing. ``userns`` (default: ``cfg.sandbox_userns``) allows the agent to
+    create user namespaces inside the sandbox.
 
     Unless ``network`` is "host", the argv expects ``run()`` to have prepared
     ``bridge_dir`` (the proxy relay socket, bridge.py and resolv.conf).
@@ -559,11 +610,31 @@ def build(
     if not project.is_dir():
         raise SandboxError("project directory not found: %s" % project)
     warnings = []
+    if userns is None:
+        userns = cfg.sandbox_userns
     argv = [
         "bwrap",
         "--die-with-parent",
         "--unshare-pid",
         "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+    ]
+    # Nested user namespaces are the usual first step of a namespace-escape exploit, and
+    # the agent doesn't need them, unless it drives a Chromium browser or rootless podman.
+    if userns:
+        warnings.append(
+            "nested user namespaces allowed (--allow-userns): needed by Chromium/Playwright "
+            "and rootless podman, but it widens the kernel attack surface"
+        )
+    elif bwrap_version() >= DISABLE_USERNS_SINCE:
+        argv += ["--unshare-user", "--disable-userns"]  # bwrap refuses the second alone
+    else:
+        warnings.append(
+            "bubblewrap %s can't block nested user namespaces (needs 0.8+)"
+            % ".".join(map(str, bwrap_version()))
+        )
+    argv += [
         "--ro-bind",
         "/",
         "/",
@@ -623,14 +694,16 @@ def build(
     if (home / ".cache").is_dir():
         argv += ["--tmpfs", str(home / ".cache")]  # private scratch; nothing persists
 
-    for path in (*(home / rel for rel in AGENT_STATE), *user_rw):
+    # Each agent's own state (login, sessions, caches) is writable; see agentstate.
+    agent_state = agentstate.state_paths(home, environ)
+    for path in (*agent_state, *user_rw):
         if path.exists():
             argv += ["--bind", str(path), str(path)]
         elif path in user_rw:
             warnings.append("writable path does not exist, skipped: %s" % path)
 
     argv += ["--bind", str(project), str(project)]
-    roots = [project, *(home / rel for rel in AGENT_STATE), *(p.resolve() for p in user_rw)]
+    roots = [project, *agent_state, *(p.resolve() for p in user_rw)]
     roots = [r for r in roots if r.exists()]
 
     # Git runs hooks and config-named programs outside the sandbox later, so in every
@@ -654,15 +727,15 @@ def build(
     for path in git_create:
         argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
 
-    # Claude Code's files that make a later, unsandboxed session run something (settings
+    # The agents' files that make a later, unsandboxed session run something (settings
     # with hooks, plugins, commands, ...) are read-only; directories other sessions read
     # from (shell snapshots, ~/.claude.json backups, ...) are private. See agentstate.
-    claude_ro, claude_create = agentstate.read_only_paths(home)
-    for path in claude_ro:
+    agent_ro, agent_create = agentstate.read_only_paths(home, environ)
+    for path in agent_ro:
         argv += ["--ro-bind", str(path), str(path)]
-    for path in claude_create:
+    for path in agent_create:
         argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
-    for path in agentstate.private_paths(home):
+    for path in agentstate.private_paths(home, environ):
         argv += ["--tmpfs", str(path)]
     for path in hides:
         if path.is_dir() and not path.is_symlink():

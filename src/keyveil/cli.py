@@ -259,6 +259,7 @@ def cmd_sandbox(args):
             network=network,
             port=cfg.port,
             bridge_dir=bridge_dir,
+            userns=True if args.allow_userns else None,
         )
 
     try:
@@ -279,8 +280,8 @@ def cmd_sandbox(args):
             file=sys.stderr,
         )
     git_before = sandbox.snapshot_git([project, *cfg.sandbox_rw, *args.rw])
-    claude_before = agentstate.snapshot(agentstate.watched_files(Path.home(), project))
-    claude_files_before = agentstate.snapshot_files(project)
+    agent_before = agentstate.snapshot(agentstate.watched_files(Path.home(), project))
+    agent_files_before = agentstate.snapshot_files(project)
     sys.stdout.flush()
     sys.stderr.flush()
     try:
@@ -289,17 +290,17 @@ def cmd_sandbox(args):
         raise CLIError(str(e)) from e
     finally:
         _report_git_audit(sandbox.audit_git(git_before))
-        _report_claude_files(agentstate.file_changes(claude_files_before, project))
-        _check_agent_settings(agentstate.changes(claude_before))
+        _report_agent_files(agentstate.file_changes(agent_files_before, project))
+        _check_agent_settings(agentstate.changes(agent_before))
 
 
-def _report_claude_files(lines):
-    """Show (and log) changed project skills, commands, agents, workflows and hooks."""
+def _report_agent_files(lines):
+    """Show (and log) changed project skills, commands, agents, hooks and agent configs."""
     if not lines:
         return
     lines = [
-        "keyveil sandbox: Claude Code files in the project changed by the agent (they can run"
-        " commands when used; check them before using Claude Code outside the sandbox):",
+        "keyveil sandbox: agent configuration files in the project changed by the agent (they"
+        " can run commands when used; check them before using the agent outside the sandbox):",
         *("  - %s" % line for line in lines),
     ]
     print("\n".join(lines), file=sys.stderr)
@@ -307,7 +308,7 @@ def _report_claude_files(lines):
 
 
 def _check_agent_settings(changes):
-    """Show security settings the agent changed in Claude Code's files; offer to undo them."""
+    """Show security settings the agent changed in the agents' files; offer to undo them."""
     from . import agentstate
 
     if not changes:
@@ -469,6 +470,12 @@ def build_parser():
         choices=cfgmod.SANDBOX_NETWORKS,
         help="isolated (default): own network with internet via slirp4netns; none: only the "
         "keyveil proxy; host: share your network (not isolated, see README)",
+    )
+    p.add_argument(
+        "--allow-userns",
+        action="store_true",
+        help="let the agent create user namespaces (Chromium/Playwright, rootless podman); "
+        "they are blocked by default (or set [sandbox] userns = true)",
     )
     p.add_argument("--dry-run", action="store_true", help="print the bwrap command and exit")
     p.add_argument(

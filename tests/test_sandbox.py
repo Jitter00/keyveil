@@ -289,20 +289,88 @@ class BuildTests(SandboxCase):
             "SENTRY_DSN": "5",
             "GOOGLE_CREDENTIALS": "6",
             "GPG_PASSPHRASE": "7",
+            "PGPASSWORD": "8",
+            "MYSQL_PWD": "9",
+            "REDIS_PWD": "10",
+            "COMPOSER_AUTH": "11",
+            "WEBPASSWORD": "12",
+            "SSH_PRIVATE_KEY_B64": "13",
+            "MINIO_ACCESS_KEY_ID": "14",
+            "SLACK_WEBHOOK_URL": "15",
             "PATH": "/bin",
             "KEYBOARD": "x",
             "TERM": "xterm",
+            "PGHOST": "db",  # looks like a database setting but holds no secret
+            "HTTP_PROXY": "http://proxy:3128",
+            "GIT_AUTHOR_NAME": "me",
         }
         _, removed, _ = self.build(environ=env)
-        self.assertEqual(removed, sorted(set(env) - {"PATH", "KEYBOARD", "TERM"}))
+        kept = {"PATH", "KEYBOARD", "TERM", "PGHOST", "HTTP_PROXY", "GIT_AUTHOR_NAME"}
+        self.assertEqual(removed, sorted(set(env) - kept))
 
     def test_more_credential_files_are_hidden(self):
-        for rel in (".config/gh/hosts.yml", ".npmrc", ".vault-token", ".psql_history"):
+        files = (
+            ".config/gh/hosts.yml",
+            ".npmrc",
+            ".vault-token",
+            ".psql_history",
+            ".config/git/credentials",
+            ".config/containers/auth.json",
+            ".config/github-copilot/hosts.json",
+            ".cline/data/secrets.json",
+            ".continue/.env",
+            ".viminfo",
+        )
+        for rel in files:
             (self.home / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.home / rel).write_text("secret\n")
         argv, _, _ = self.build()
-        for rel in (".config/gh", ".npmrc", ".vault-token", ".psql_history"):
+        hidden = (
+            ".config/gh",
+            ".npmrc",
+            ".vault-token",
+            ".psql_history",
+            ".config/git/credentials",
+            ".config/containers/auth.json",
+            ".config/github-copilot",
+            ".cline",
+            ".continue/.env",
+            ".viminfo",
+        )
+        for rel in hidden:
             self.assertIn(str(self.home / rel), argv, rel)
+        # a file is replaced by /dev/null, a directory by an empty tmpfs
+        i = argv.index(str(self.home / ".config/git/credentials"))
+        self.assertEqual(argv[i - 2 : i], ["--ro-bind", "/dev/null"])
+        self.assertEqual(argv[argv.index(str(self.home / ".cline")) - 1], "--tmpfs")
+
+    def test_other_agents_state_is_writable_with_their_configs_read_only(self):
+        codex, gemini = self.home / ".codex", self.home / ".gemini"
+        for rel in ("auth.json", "config.toml", "hooks.json"):
+            codex.mkdir(exist_ok=True)
+            (codex / rel).write_text("")
+        gemini.mkdir()
+        (gemini / "oauth_creds.json").write_text("{}")
+        (gemini / "settings.json").write_text("{}")
+        argv, _, _ = self.build()
+
+        def positions(flag, path):
+            return [i for i, a in enumerate(argv) if a == flag and argv[i + 1] == str(path)]
+
+        for state in (codex, gemini):
+            self.assertEqual(len(positions("--bind", state)), 1, state)
+        for ro in (codex / "config.toml", codex / "hooks.json", gemini / "settings.json"):
+            (rw,), (r,) = positions("--bind", ro.parent), positions("--ro-bind", ro)
+            self.assertGreater(r, rw, ro)  # read-only mount covers the writable one
+        for create in (codex / "memories", gemini / "commands"):
+            self.assertEqual(len(positions("--tmpfs", create)), 1, create)
+        # login files stay readable unless hidden on request
+        for login in (codex / "auth.json", gemini / "oauth_creds.json"):
+            self.assertNotIn(str(login), argv, login)
+        argv, _, _ = self.build(extra_hide=[str(codex / "auth.json")])
+        i = argv.index(str(codex / "auth.json"))
+        self.assertEqual(argv[i - 2 : i], ["--ro-bind", "/dev/null"])
+        self.assertGreater(i, positions("--bind", codex)[0])
 
     def test_ssh_agent_requires_a_socket(self):
         with self.assertRaises(sandbox.SandboxError):
@@ -320,6 +388,37 @@ class BuildTests(SandboxCase):
             inner[1:6], ["-I", "/run/keyveil/bridge.py", "9999", "/run/keyveil/proxy.sock", "--"]
         )
         self.assertEqual(inner[6:], command)
+
+    def test_namespaces(self):
+        with mock.patch.object(sandbox, "bwrap_version", return_value=(0, 9, 0)):
+            argv, _, warnings = self.build()
+            for flag in ("--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup"):
+                self.assertIn(flag, argv)
+            self.assertIn("--disable-userns", argv)
+            self.assertIn("--unshare-user", argv)  # bwrap refuses --disable-userns without it
+            self.assertFalse(any("user namespaces" in w for w in warnings), warnings)
+            argv, _, warnings = self.build(userns=True)
+            self.assertNotIn("--disable-userns", argv)
+            self.assertTrue(any("--allow-userns" in w for w in warnings), warnings)
+            cfg = dataclasses.replace(self.cfg, sandbox_userns=True)
+            argv, _, _ = self.build(cfg=cfg)
+            self.assertNotIn("--disable-userns", argv)
+        with mock.patch.object(sandbox, "bwrap_version", return_value=(0, 6, 1)):
+            argv, _, warnings = self.build()
+            self.assertNotIn("--disable-userns", argv)
+            self.assertTrue(any("needs 0.8+" in w for w in warnings), warnings)
+
+    def test_bwrap_version_is_parsed_and_cached(self):
+        sandbox._BWRAP_VERSION = None
+        self.addCleanup(setattr, sandbox, "_BWRAP_VERSION", None)
+        done = mock.Mock(stdout="bubblewrap 0.11.0\n")
+        with mock.patch.object(sandbox.subprocess, "run", return_value=done) as run:
+            self.assertEqual(sandbox.bwrap_version(), (0, 11, 0))
+            self.assertEqual(sandbox.bwrap_version(), (0, 11, 0))
+            self.assertEqual(run.call_count, 1)
+        sandbox._BWRAP_VERSION = None
+        with mock.patch.object(sandbox.subprocess, "run", side_effect=OSError):
+            self.assertEqual(sandbox.bwrap_version(), (0, 0, 0))
 
     def test_network_modes(self):
         bridge = self.root / "bridge"
@@ -447,6 +546,16 @@ class LiveTests(SandboxCase):
         self.last = result
         self.assertEqual(result.returncode, 0, result.stderr)
         return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+    def test_nested_user_namespaces_are_blocked_unless_allowed(self):
+        if sandbox.bwrap_version() < sandbox.DISABLE_USERNS_SINCE:
+            self.skipTest("bwrap %s has no --disable-userns" % (sandbox.bwrap_version(),))
+        if not shutil.which("unshare"):
+            self.skipTest("unshare (util-linux) is required")
+        probe = 'echo "userns=$(unshare -U true 2>/dev/null && echo yes || echo no)"'
+        self.assertEqual(self.run_inside(probe), {"userns": "no"})
+        self.assertEqual(self.run_inside(probe, "--allow-userns"), {"userns": "yes"})
+        self.assertIn("nested user namespaces allowed", self.last.stderr)
 
     def test_confinement(self):
         out = self.run_inside(r"""
