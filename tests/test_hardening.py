@@ -5,6 +5,7 @@ import http.client
 import io
 import json
 import os
+import resource
 import socket
 import subprocess
 import sys
@@ -452,7 +453,7 @@ class BindAndHardenTests(unittest.TestCase):
             mock.patch.object(proxy.ctypes, "get_errno", return_value=12),
             mock.patch.object(proxy.sys, "stderr", io.StringIO()) as err,
         ):
-            warnings = proxy.harden()
+            warnings = proxy.harden() + proxy.lock_memory()
         self.assertEqual(len(warnings), 2)
         self.assertIn("ulimit -l", warnings[1])
         self.assertEqual(err.getvalue().count("keyveil: warning:"), 2)
@@ -461,6 +462,103 @@ class BindAndHardenTests(unittest.TestCase):
             mock.patch.object(proxy.sys, "stderr", io.StringIO()),
         ):
             self.assertEqual(len(proxy.harden()), 1)
+            self.assertEqual(proxy.lock_memory(), [])  # harden() already reported it
+
+    def test_future_allocations_are_locked_only_with_enough_memlock(self):
+        calls = []
+
+        class Libc:
+            def prctl(self, *a):
+                return 0
+
+            def mlockall(self, flags):
+                calls.append(flags)
+                return 0
+
+        mib = 1024 * 1024
+        cases = [
+            (resource.RLIM_INFINITY, proxy.MCL_CURRENT | proxy.MCL_FUTURE, 0),
+            (proxy.MLOCK_BUDGET, proxy.MCL_CURRENT | proxy.MCL_FUTURE, 0),
+            (64 * mib, proxy.MCL_CURRENT, 1),  # the common systemd default
+            (8 * mib, proxy.MCL_CURRENT, 1),
+        ]
+        for soft, flags, n_warnings in cases:
+            calls.clear()
+            with (
+                mock.patch.object(proxy.ctypes, "CDLL", return_value=Libc()),
+                mock.patch.object(proxy.resource, "getrlimit", return_value=(soft, soft)),
+                mock.patch.object(proxy.sys, "stderr", io.StringIO()),
+            ):
+                warnings = proxy.lock_memory()
+            self.assertEqual(calls, [flags], soft)
+            self.assertEqual(len(warnings), n_warnings, soft)
+            if n_warnings:
+                self.assertIn("only the memory in use at startup", warnings[0])
+
+    def test_harden_raises_the_soft_limit_and_shrinks_thread_stacks(self):
+        with (
+            mock.patch.object(proxy.ctypes, "CDLL", side_effect=OSError),
+            mock.patch.object(proxy.resource, "getrlimit", return_value=(1, 2)),
+            mock.patch.object(proxy.resource, "setrlimit") as setrlimit,
+            mock.patch.object(proxy.threading, "stack_size") as stack_size,
+            mock.patch.object(proxy.sys, "stderr", io.StringIO()),
+        ):
+            proxy.harden()
+        setrlimit.assert_called_once_with(resource.RLIMIT_MEMLOCK, (2, 2))
+        stack_size.assert_called_once_with(proxy.THREAD_STACK)
+
+    def test_many_concurrent_requests_under_a_small_memlock_limit(self):
+        """With mlockall(MCL_FUTURE) and 8 MiB thread stacks, a 64 MiB `ulimit -l` let the
+        kernel refuse the sixth handler thread; the proxy must serve 30 at once."""
+        limit = 64 * 1024 * 1024
+        if resource.getrlimit(resource.RLIMIT_MEMLOCK)[1] < limit:
+            self.skipTest("memlock hard limit below 64 MiB")
+        up = start(Upstream)
+        self.addCleanup(lambda: (up.shutdown(), up.server_close()))
+        routes = {
+            "routes": {"echo": {"upstream": "http://127.0.0.1:%d" % up.server_port, "env": "K"}}
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(routes, f)
+        self.addCleanup(os.unlink, f.name)
+        port = free_port()
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "keyveil.proxy", "--port", str(port), "--routes", f.name],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_MEMLOCK, (limit, limit)),
+        )
+        self.addCleanup(lambda: (proc.kill(), proc.wait(), proc.stderr.close()))
+        proc.stdin.write("K=x\n")
+        proc.stdin.close()
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.2).close()
+                break
+            except OSError:
+                time.sleep(0.05)
+        else:
+            self.fail("proxy did not start: %s" % proc.stderr.read())
+        results = []
+
+        def one():
+            try:
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+                conn.request("GET", "/echo/slow")  # upstream waits, so the threads overlap
+                results.append(conn.getresponse().status)
+                conn.close()
+            except OSError as e:
+                results.append(repr(e))
+
+        threads = [threading.Thread(target=one) for _ in range(30)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        self.assertEqual(results, [200] * 30)
 
 
 if __name__ == "__main__":

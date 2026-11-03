@@ -260,7 +260,8 @@ The details:
 - Logs only method, path and status — never headers or bodies.
 - On Linux it calls `mlockall` (key never swapped to disk) and `prctl(PR_SET_DUMPABLE, 0)`
   (no core dumps; blocks same-user `/proc/<pid>/mem` and `environ` reads). If either fails,
-  it says so in the log.
+  it says so in the log. With a small `ulimit -l` (below 256M) only the memory in use at
+  startup, which holds the keys, is locked; see [Limitations](#limitations).
 - A route is enabled only if its key is present in the decrypted input.
 
 Built-in routes:
@@ -809,9 +810,15 @@ Also worth doing, outside keyveil:
   unlock: the config file (its `[decrypt] command` is run with `/bin/sh`), the installed
   package, or your shell aliases and PATH. Your passphrase or key touch authorizes whatever is
   there at that moment, so be suspicious of an unlock prompt you didn't trigger.
-- `mlockall` needs a sufficient `ulimit -l`. If it fails, the proxy still runs and writes
-  `keyveil: warning: memory not locked …` to the log; raise the limit (e.g. `memlock` in
-  `/etc/security/limits.conf`) to fix it.
+- **Memory locking depends on `ulimit -l`.** With at least 256M (or `unlimited`), everything
+  the proxy allocates is locked and can never be swapped. Below that, only the memory in use
+  when the keys are loaded is locked, and the log says `only the memory in use at startup is
+  locked`: the keys stay in RAM, but a later copy made while handling a request could in
+  principle reach swap. (Locking every future allocation under a small limit would make the
+  kernel refuse new threads, so the proxy would stop answering.) If locking fails altogether
+  the proxy still runs and logs `memory not locked`. To raise the limit, set `memlock` in
+  `/etc/security/limits.conf` (or `DefaultLimitMEMLOCK` in `/etc/systemd/user.conf`), then
+  log in again.
 - Prompts and responses pass through the proxy's memory but are never logged.
 - If decryption yields none of the expected variables, the proxy exits and logs the variable
   **names** it found (never values) to `~/.local/state/keyveil/keyveil.log`.

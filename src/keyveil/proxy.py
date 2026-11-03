@@ -22,6 +22,7 @@ import ipaddress
 import json
 import os
 import re
+import resource
 import signal
 import ssl
 import sys
@@ -65,6 +66,11 @@ AMBIGUOUS_PATH = re.compile(r";|//|%(2f|5c|2e|00|25)", re.IGNORECASE)
 ALLOW = {}  # route prefix -> ["METHOD /path-glob", ...]; absent means every path is allowed
 SSL_CTX = ssl.create_default_context()
 MAX_BODY = 64 * 1024 * 1024  # largest request body forwarded (bytes)
+# Locked memory the proxy needs headroom for: MAX_BODY (and a copy of it) plus handler
+# threads. Below this `ulimit -l`, only memory in use at startup is locked (see lock_memory).
+MLOCK_BUDGET = 256 * 1024 * 1024
+THREAD_STACK = 1024 * 1024  # handler thread stack (bytes); counts against `ulimit -l` when locked
+MCL_CURRENT, MCL_FUTURE = 1, 2
 _ALLOW_RULE = re.compile(r"[A-Z]+ /\S*")
 
 
@@ -188,32 +194,78 @@ def path_allowed(route, method, rel_path):
     return any(fnmatch.fnmatchcase(target, rule) for rule in rules)
 
 
-def harden():
-    """Keep secrets out of swap and core dumps; block same-user /proc/<pid>/mem reads.
-
-    Linux/glibc only. The proxy still works if a step fails, just less hardened: each
-    failure is reported as one warning line on stderr (the log). Returns the warnings.
-    """
-    warnings = []
+def _libc():
     try:
-        libc = ctypes.CDLL("libc.so.6", use_errno=True)
+        return ctypes.CDLL("libc.so.6", use_errno=True)
     except OSError:
-        warnings.append("not hardened: libc.so.6 not found (not Linux/glibc)")
-    else:
-        if libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE = 0
-            warnings.append(
-                "core dumps and same-user memory reads not blocked (prctl: %s)"
-                % os.strerror(ctypes.get_errno())
-            )
-        if libc.mlockall(1 | 2) != 0:  # MCL_CURRENT | MCL_FUTURE
-            warnings.append(
-                "memory not locked, keys could be swapped to disk (mlockall: %s); "
-                "raise the limit shown by `ulimit -l`" % os.strerror(ctypes.get_errno())
-            )
+        return None
+
+
+def _warn(warnings):
     for w in warnings:
         sys.stderr.write("keyveil: warning: %s\n" % w)
     sys.stderr.flush()
     return warnings
+
+
+def harden():
+    """Block core dumps and same-user /proc/<pid>/mem reads, and prepare for lock_memory().
+
+    Linux/glibc only. Raises the memlock soft limit to the hard limit and gives handler
+    threads a small stack, so that locking memory later doesn't stop the proxy from starting
+    threads. The proxy still works if a step fails, just less hardened: each failure is
+    reported as one warning line on stderr (the log). Returns the warnings.
+    """
+    warnings = []
+    libc = _libc()
+    if libc is None:
+        warnings.append("not hardened: libc.so.6 not found (not Linux/glibc)")
+    elif libc.prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE = 0
+        warnings.append(
+            "core dumps and same-user memory reads not blocked (prctl: %s)"
+            % os.strerror(ctypes.get_errno())
+        )
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+        if soft != hard:
+            resource.setrlimit(resource.RLIMIT_MEMLOCK, (hard, hard))
+    except (ValueError, OSError):
+        pass
+    threading.stack_size(THREAD_STACK)
+    return _warn(warnings)
+
+
+def lock_memory():
+    """Keep the keys out of swap: mlockall, called once the keys are loaded.
+
+    With enough `ulimit -l` (MLOCK_BUDGET) every future allocation is locked too
+    (MCL_FUTURE). Below it only the memory in use now is locked: locking future
+    allocations would make the kernel refuse new thread stacks and large request bodies.
+    Returns the warnings (also written to stderr).
+    """
+    libc = _libc()
+    if libc is None:
+        return []  # harden() already said so
+    try:
+        soft, _hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    except (ValueError, OSError):
+        soft = 0
+    unlimited = soft == resource.RLIM_INFINITY or soft >= MLOCK_BUDGET
+    flags = MCL_CURRENT | MCL_FUTURE if unlimited else MCL_CURRENT
+    warnings = []
+    if libc.mlockall(flags) != 0:
+        warnings.append(
+            "memory not locked, keys could be swapped to disk (mlockall: %s); "
+            "raise the limit shown by `ulimit -l` to at least %dM"
+            % (os.strerror(ctypes.get_errno()), MLOCK_BUDGET // (1024 * 1024))
+        )
+    elif not unlimited:
+        warnings.append(
+            "only the memory in use at startup is locked (`ulimit -l` is %dK); later "
+            "allocations could be swapped to disk. Raise it to at least %dM to lock everything"
+            % (soft // 1024, MLOCK_BUDGET // (1024 * 1024))
+        )
+    return _warn(warnings)
 
 
 def is_loopback(host):
@@ -494,6 +546,7 @@ def serve(env_text, host="127.0.0.1", port=8787, idle_timeout=0):
     load_keys(env)
     names = sorted(env)
     del env
+    lock_memory()
     if not KEYS:
         wanted = sorted(e for _, e, _ in ROUTES.values())
         sys.exit(
