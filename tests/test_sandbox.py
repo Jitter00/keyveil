@@ -344,6 +344,34 @@ class BuildTests(SandboxCase):
         self.assertEqual(argv[i - 2 : i], ["--ro-bind", "/dev/null"])
         self.assertEqual(argv[argv.index(str(self.home / ".cline")) - 1], "--tmpfs")
 
+    def test_other_agents_state_is_writable_with_their_configs_read_only(self):
+        codex, gemini = self.home / ".codex", self.home / ".gemini"
+        for rel in ("auth.json", "config.toml", "hooks.json"):
+            codex.mkdir(exist_ok=True)
+            (codex / rel).write_text("")
+        gemini.mkdir()
+        (gemini / "oauth_creds.json").write_text("{}")
+        (gemini / "settings.json").write_text("{}")
+        argv, _, _ = self.build()
+
+        def positions(flag, path):
+            return [i for i, a in enumerate(argv) if a == flag and argv[i + 1] == str(path)]
+
+        for state in (codex, gemini):
+            self.assertEqual(len(positions("--bind", state)), 1, state)
+        for ro in (codex / "config.toml", codex / "hooks.json", gemini / "settings.json"):
+            (rw,), (r,) = positions("--bind", ro.parent), positions("--ro-bind", ro)
+            self.assertGreater(r, rw, ro)  # read-only mount covers the writable one
+        for create in (codex / "memories", gemini / "commands"):
+            self.assertEqual(len(positions("--tmpfs", create)), 1, create)
+        # login files stay readable unless hidden on request
+        for login in (codex / "auth.json", gemini / "oauth_creds.json"):
+            self.assertNotIn(str(login), argv, login)
+        argv, _, _ = self.build(extra_hide=[str(codex / "auth.json")])
+        i = argv.index(str(codex / "auth.json"))
+        self.assertEqual(argv[i - 2 : i], ["--ro-bind", "/dev/null"])
+        self.assertGreater(i, positions("--bind", codex)[0])
+
     def test_ssh_agent_requires_a_socket(self):
         with self.assertRaises(sandbox.SandboxError):
             self.build(ssh_agent=True, environ={})

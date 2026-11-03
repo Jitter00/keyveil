@@ -572,6 +572,26 @@ Also: values in a settings file's `env` block override variables set in your she
 have an alias that sets its own `ANTHROPIC_BASE_URL` (say, for another gateway), pass it with
 `--settings` too.
 
+### Other agents: Codex CLI, Gemini CLI
+
+The same two modes exist for OpenAI's Codex CLI and Google's Gemini CLI. The sandbox treats
+their folders (`~/.codex`, `~/.gemini`) like `~/.claude`: writable, with the files that make a
+later run execute something read-only (see the [table](#what-is-inside-and-what-isnt)). With
+their own login the agent can read its login file, as with `claude-box`; routed through
+keyveil, hide it:
+
+```bash
+codex-box()        { keyveil sandbox -- codex "$@"; }
+codex-proxy-box()  { OPENAI_BASE_URL=http://127.0.0.1:8787/openai/v1 OPENAI_API_KEY=local-proxy keyveil sandbox --keep-env OPENAI_API_KEY --hide "$HOME/.codex/auth.json" -- codex "$@"; }
+gemini-box()       { keyveil sandbox -- gemini "$@"; }
+```
+
+`codex-proxy-box` needs `OPENAI_API_KEY` in your encrypted file. (`OPENAI_API_KEY` looks like
+a secret, so the sandbox would strip it: `--keep-env` keeps the placeholder.) Gemini's own API
+isn't a built-in route; add one in `routes.json` (`"gemini": {"upstream":
+"https://generativelanguage.googleapis.com", "env": "GEMINI_API_KEY", "auth": "header:x-goog-api-key"}`)
+and point the CLI at it the same way, hiding `~/.gemini/oauth_creds.json`.
+
 ## Confine your agents: `keyveil sandbox`
 
 Editors and agents run as **you**. If an agent is tricked by a prompt injection (a malicious
@@ -649,7 +669,7 @@ everything else keeps working:
 | Inside the sandbox | |
 |---|---|
 | The project directory | read-write, except what git runs later, outside: in every repository in it, the hooks, config (and files it includes or a `core.hooksPath` inside the project) are read-only, and `.git` folders can't be moved or replaced. After the agent exits, keyveil checks them again (see below) |
-| Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write (this includes your subscription login file unless you `--hide` it), except what makes Claude Code run something later, outside: `settings.json`, `CLAUDE.md`, `plugins`, `commands`, `agents`, `skills`, `hooks`, `output-styles`, `rules` and scripts directly in `~/.claude` are read-only. `backups`, `shell-snapshots`, `session-env` and `downloads` are private, empty copies. Security settings in `~/.claude.json` and the project's `.claude/settings*.json` and `.mcp.json` are checked after exit (see below) |
+| Agent state: Claude Code (`~/.claude`, `~/.claude.json`), Codex CLI (`~/.codex`, or `$CODEX_HOME` inside your home), Gemini CLI (`~/.gemini`) | read-write (this includes the agent's login file, `~/.claude/.credentials.json`, `~/.codex/auth.json`, `~/.gemini/oauth_creds.json`, unless you `--hide` it), except what makes the agent run something later, outside, which is read-only: for Claude `settings.json`, `CLAUDE.md`, `plugins`, `commands`, `agents`, `skills`, `hooks`, `output-styles`, `rules`; for Codex `config.toml` and `*.config.toml` profiles, `hooks.json`, `AGENTS.md`, `memories`, `skills`, `prompts`, `plugins`, `agents`, `rules`, `hooks`; for Gemini `settings.json`, `GEMINI.md`, `trustedFolders.json`, `.env`, `commands`, `extensions`, `skills`, `agents`, `hooks`, `policies`; plus scripts directly in a state folder. Claude's `backups`, `shell-snapshots`, `session-env` and `downloads` are private, empty copies. Security settings in `~/.claude.json` and the project's `.claude/settings*.json` and `.mcp.json` are checked after exit, and changes to the project's `.claude/{skills,commands,agents,workflows,hooks}`, `.codex/{config.toml,hooks.json}` and `.gemini/{settings.json,commands}` are reported (see below) |
 | The rest of the filesystem | read-only, but **readable**: your tools work, `~/.bashrc`, PATH, keyveil's install and config can't be changed, and anything not hidden (other projects, their `.env` files, tool configs) can be read and sent over the network |
 | `/run`, `/tmp`, `~/.cache` | private and empty: no Docker/LXD/libvirt/ssh-agent/keyring sockets |
 | `~/.ssh`, `~/.gnupg`, cloud CLI credentials (`aws`, `gcloud`, `az`, `kubectl`, `gh`, `doctl`, `op`, `rclone`, …), package-registry tokens (`~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, Maven, Gradle), git and container-registry logins (`~/.git-credentials`, `~/.config/git/credentials`, `~/.config/containers/auth.json`), editor extensions' key stores (Copilot, Cline, Continue), `~/.vault-token`, `~/.terraform.d`, `~/.fly`, `~/.config/configstore`, browser and Thunderbird profiles, shell, editor and REPL history, keyveil's config, your encrypted key file and identity | hidden. The list can't cover every tool: `--hide PATH` adds more |

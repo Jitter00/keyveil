@@ -279,8 +279,8 @@ def cmd_sandbox(args):
             file=sys.stderr,
         )
     git_before = sandbox.snapshot_git([project, *cfg.sandbox_rw, *args.rw])
-    claude_before = agentstate.snapshot(agentstate.watched_files(Path.home(), project))
-    claude_files_before = agentstate.snapshot_files(project)
+    agent_before = agentstate.snapshot(agentstate.watched_files(Path.home(), project))
+    agent_files_before = agentstate.snapshot_files(project)
     sys.stdout.flush()
     sys.stderr.flush()
     try:
@@ -289,17 +289,17 @@ def cmd_sandbox(args):
         raise CLIError(str(e)) from e
     finally:
         _report_git_audit(sandbox.audit_git(git_before))
-        _report_claude_files(agentstate.file_changes(claude_files_before, project))
-        _check_agent_settings(agentstate.changes(claude_before))
+        _report_agent_files(agentstate.file_changes(agent_files_before, project))
+        _check_agent_settings(agentstate.changes(agent_before))
 
 
-def _report_claude_files(lines):
-    """Show (and log) changed project skills, commands, agents, workflows and hooks."""
+def _report_agent_files(lines):
+    """Show (and log) changed project skills, commands, agents, hooks and agent configs."""
     if not lines:
         return
     lines = [
-        "keyveil sandbox: Claude Code files in the project changed by the agent (they can run"
-        " commands when used; check them before using Claude Code outside the sandbox):",
+        "keyveil sandbox: agent configuration files in the project changed by the agent (they"
+        " can run commands when used; check them before using the agent outside the sandbox):",
         *("  - %s" % line for line in lines),
     ]
     print("\n".join(lines), file=sys.stderr)
@@ -307,7 +307,7 @@ def _report_claude_files(lines):
 
 
 def _check_agent_settings(changes):
-    """Show security settings the agent changed in Claude Code's files; offer to undo them."""
+    """Show security settings the agent changed in the agents' files; offer to undo them."""
     from . import agentstate
 
     if not changes:

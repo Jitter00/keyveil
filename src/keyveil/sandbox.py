@@ -5,9 +5,9 @@ keyveil proxy on 127.0.0.1. What it can no longer do:
   * become root: no_new_privs blocks sudo/su/pkexec and setuid binaries;
   * reach Docker / LXD / libvirt / ssh-agent / the desktop keyring: /run and /tmp are private;
   * tamper with what runs outside the sandbox: everything except the project and the agent's
-    own state is read-only (~/.bashrc, PATH, keyveil's install and config, ...). In the
-    project's git repositories the hooks, config and git dirs can't be changed or swapped,
-    and they are checked again after the agent exits;
+    own state (Claude Code, Codex CLI, Gemini CLI) is read-only (~/.bashrc, PATH, keyveil's
+    install and config, ...). In the project's git repositories the hooks, config and git
+    dirs can't be changed or swapped, and they are checked again after the agent exits;
   * read common secret stores (~/.ssh, ~/.gnupg, cloud CLI credentials, browser profiles...);
   * see or signal other processes (own PID namespace), including the keyveil proxy;
   * reach anything on the host's loopback or abstract Unix sockets (X11, D-Bus, ibus...):
@@ -100,8 +100,6 @@ HIDDEN_IN_HOME = (
     ".fly",
     ".config/hcloud",
 )
-# Writable for the agent if they exist (relative to $HOME): Claude Code's state.
-AGENT_STATE = (".claude", ".claude.json")
 # Run code later, outside the sandbox (relative to $HOME). Read-only like the rest of $HOME;
 # listed so that no writable path (--rw, the project) can contain them.
 RUNS_CODE_LATER = (
@@ -645,14 +643,16 @@ def build(
     if (home / ".cache").is_dir():
         argv += ["--tmpfs", str(home / ".cache")]  # private scratch; nothing persists
 
-    for path in (*(home / rel for rel in AGENT_STATE), *user_rw):
+    # Each agent's own state (login, sessions, caches) is writable; see agentstate.
+    agent_state = agentstate.state_paths(home, environ)
+    for path in (*agent_state, *user_rw):
         if path.exists():
             argv += ["--bind", str(path), str(path)]
         elif path in user_rw:
             warnings.append("writable path does not exist, skipped: %s" % path)
 
     argv += ["--bind", str(project), str(project)]
-    roots = [project, *(home / rel for rel in AGENT_STATE), *(p.resolve() for p in user_rw)]
+    roots = [project, *agent_state, *(p.resolve() for p in user_rw)]
     roots = [r for r in roots if r.exists()]
 
     # Git runs hooks and config-named programs outside the sandbox later, so in every
@@ -676,15 +676,15 @@ def build(
     for path in git_create:
         argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
 
-    # Claude Code's files that make a later, unsandboxed session run something (settings
+    # The agents' files that make a later, unsandboxed session run something (settings
     # with hooks, plugins, commands, ...) are read-only; directories other sessions read
     # from (shell snapshots, ~/.claude.json backups, ...) are private. See agentstate.
-    claude_ro, claude_create = agentstate.read_only_paths(home)
-    for path in claude_ro:
+    agent_ro, agent_create = agentstate.read_only_paths(home, environ)
+    for path in agent_ro:
         argv += ["--ro-bind", str(path), str(path)]
-    for path in claude_create:
+    for path in agent_create:
         argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
-    for path in agentstate.private_paths(home):
+    for path in agentstate.private_paths(home, environ):
         argv += ["--tmpfs", str(path)]
     for path in hides:
         if path.is_dir() and not path.is_symlink():
