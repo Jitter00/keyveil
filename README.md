@@ -619,6 +619,11 @@ everything else keeps working:
   keyveil's own files are hidden on purpose, so the command isn't available there.
 - **Start it from inside the project folder**, never from your home folder (keyveil refuses).
   The agent can change everything in that folder, so keep secrets out of it.
+- **Read-only still means readable.** Apart from the hidden paths listed below, the agent can
+  read every file in your home (other projects' `.env` files, tool configs, notes) and it has
+  internet access, so it can send them anywhere. The hidden list is a safety net, not a wall:
+  keep secrets out of your home where you can, and hide the rest with `--hide PATH` (or
+  `[sandbox] hide = [...]` in `config.toml`).
 - **Anything outside the project is read-only** for the agent: it can't edit other projects,
   `~/.bashrc` or installed programs, and global installs (`pip install --user`, `npm -g`)
   fail. Use a project-local virtual environment instead.
@@ -636,7 +641,7 @@ everything else keeps working:
   or warn; run those in a normal terminal. Folders that contain a git repository (and the
   `.git` folders themselves) can't be renamed or deleted while the agent runs.
 - **Secret-looking environment variables are removed** (`*_KEY`, `*_TOKEN`, `*_PAT`,
-  `*_PASSWORD`, `DATABASE_URL`, `*_DSN`, `AWS_*`, …, in any letter case);
+  `*PASSWORD*`, `*_PWD`, `*_AUTH`, `DATABASE_URL`, `*_DSN`, `AWS_*`, …, in any letter case);
   the names are printed when it starts. If a tool really needs one, add `--keep-env NAME`.
 
 ### What is inside and what isn't
@@ -645,9 +650,9 @@ everything else keeps working:
 |---|---|
 | The project directory | read-write, except what git runs later, outside: in every repository in it, the hooks, config (and files it includes or a `core.hooksPath` inside the project) are read-only, and `.git` folders can't be moved or replaced. After the agent exits, keyveil checks them again (see below) |
 | Claude Code's state (`~/.claude`, `~/.claude.json`) | read-write (this includes your subscription login file unless you `--hide` it), except what makes Claude Code run something later, outside: `settings.json`, `CLAUDE.md`, `plugins`, `commands`, `agents`, `skills`, `hooks`, `output-styles`, `rules` and scripts directly in `~/.claude` are read-only. `backups`, `shell-snapshots`, `session-env` and `downloads` are private, empty copies. Security settings in `~/.claude.json` and the project's `.claude/settings*.json` and `.mcp.json` are checked after exit (see below) |
-| The rest of the filesystem | read-only: your tools work, but `~/.bashrc`, PATH, keyveil's install and config can't be changed |
+| The rest of the filesystem | read-only, but **readable**: your tools work, `~/.bashrc`, PATH, keyveil's install and config can't be changed, and anything not hidden (other projects, their `.env` files, tool configs) can be read and sent over the network |
 | `/run`, `/tmp`, `~/.cache` | private and empty: no Docker/LXD/libvirt/ssh-agent/keyring sockets |
-| `~/.ssh`, `~/.gnupg`, cloud CLI credentials (`aws`, `gcloud`, `az`, `kubectl`, `gh`, `doctl`, `op`, `rclone`, …), package-registry tokens (`~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, Maven, Gradle), `~/.vault-token`, `~/.terraform.d`, browser and Thunderbird profiles, shell and REPL history, keyveil's config, your encrypted key file and identity | hidden. The list can't cover every tool: `--hide PATH` adds more |
+| `~/.ssh`, `~/.gnupg`, cloud CLI credentials (`aws`, `gcloud`, `az`, `kubectl`, `gh`, `doctl`, `op`, `rclone`, …), package-registry tokens (`~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, Maven, Gradle), git and container-registry logins (`~/.git-credentials`, `~/.config/git/credentials`, `~/.config/containers/auth.json`), editor extensions' key stores (Copilot, Cline, Continue), `~/.vault-token`, `~/.terraform.d`, `~/.fly`, `~/.config/configstore`, browser and Thunderbird profiles, shell, editor and REPL history, keyveil's config, your encrypted key file and identity | hidden. The list can't cover every tool: `--hide PATH` adds more |
 | `sudo`, `su`, setuid programs | can't gain privileges (`no_new_privs`) |
 | Other processes (including keyveil) | invisible (own PID namespace) |
 | Environment variables that look like secrets | removed; the names are printed |

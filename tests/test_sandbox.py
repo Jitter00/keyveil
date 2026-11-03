@@ -289,20 +289,60 @@ class BuildTests(SandboxCase):
             "SENTRY_DSN": "5",
             "GOOGLE_CREDENTIALS": "6",
             "GPG_PASSPHRASE": "7",
+            "PGPASSWORD": "8",
+            "MYSQL_PWD": "9",
+            "REDIS_PWD": "10",
+            "COMPOSER_AUTH": "11",
+            "WEBPASSWORD": "12",
+            "SSH_PRIVATE_KEY_B64": "13",
+            "MINIO_ACCESS_KEY_ID": "14",
+            "SLACK_WEBHOOK_URL": "15",
             "PATH": "/bin",
             "KEYBOARD": "x",
             "TERM": "xterm",
+            "PGHOST": "db",  # looks like a database setting but holds no secret
+            "HTTP_PROXY": "http://proxy:3128",
+            "GIT_AUTHOR_NAME": "me",
         }
         _, removed, _ = self.build(environ=env)
-        self.assertEqual(removed, sorted(set(env) - {"PATH", "KEYBOARD", "TERM"}))
+        kept = {"PATH", "KEYBOARD", "TERM", "PGHOST", "HTTP_PROXY", "GIT_AUTHOR_NAME"}
+        self.assertEqual(removed, sorted(set(env) - kept))
 
     def test_more_credential_files_are_hidden(self):
-        for rel in (".config/gh/hosts.yml", ".npmrc", ".vault-token", ".psql_history"):
+        files = (
+            ".config/gh/hosts.yml",
+            ".npmrc",
+            ".vault-token",
+            ".psql_history",
+            ".config/git/credentials",
+            ".config/containers/auth.json",
+            ".config/github-copilot/hosts.json",
+            ".cline/data/secrets.json",
+            ".continue/.env",
+            ".viminfo",
+        )
+        for rel in files:
             (self.home / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.home / rel).write_text("secret\n")
         argv, _, _ = self.build()
-        for rel in (".config/gh", ".npmrc", ".vault-token", ".psql_history"):
+        hidden = (
+            ".config/gh",
+            ".npmrc",
+            ".vault-token",
+            ".psql_history",
+            ".config/git/credentials",
+            ".config/containers/auth.json",
+            ".config/github-copilot",
+            ".cline",
+            ".continue/.env",
+            ".viminfo",
+        )
+        for rel in hidden:
             self.assertIn(str(self.home / rel), argv, rel)
+        # a file is replaced by /dev/null, a directory by an empty tmpfs
+        i = argv.index(str(self.home / ".config/git/credentials"))
+        self.assertEqual(argv[i - 2 : i], ["--ro-bind", "/dev/null"])
+        self.assertEqual(argv[argv.index(str(self.home / ".cline")) - 1], "--tmpfs")
 
     def test_ssh_agent_requires_a_socket(self):
         with self.assertRaises(sandbox.SandboxError):

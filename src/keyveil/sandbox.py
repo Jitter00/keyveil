@@ -85,6 +85,20 @@ HIDDEN_IN_HOME = (
     ".mysql_history",
     ".node_repl_history",
     ".sqlite_history",
+    ".irb_history",
+    ".local/share/zsh/history",
+    ".config/fish/fish_variables",  # `set -U` variables, often tokens
+    ".viminfo",  # command and search history, registers
+    ".local/share/nvim/shada",
+    ".ipython/profile_default/history.sqlite",
+    ".config/git/credentials",  # git-credential-store's XDG location
+    ".config/containers/auth.json",  # podman / skopeo registry logins
+    ".config/github-copilot",  # editor extension's OAuth tokens (hosts.json)
+    ".cline",  # editor extension; data/secrets.json holds API keys in clear
+    ".continue/.env",  # editor extension's API keys
+    ".config/configstore",  # npm-style token stores of many CLIs
+    ".fly",
+    ".config/hcloud",
 )
 # Writable for the agent if they exist (relative to $HOME): Claude Code's state.
 AGENT_STATE = (".claude", ".claude.json")
@@ -121,7 +135,15 @@ SECRET_ENV = (
     "*_SECRET_*",
     "*SECRET_KEY*",
     "*_PASSWORD",
+    "*PASSWORD*",
     "*_PASSWD",
+    "*_PWD",
+    "PGPASSWORD",
+    "MYSQL_PWD",
+    "*_AUTH",
+    "*_PRIVATE_KEY*",
+    "*_ACCESS_KEY*",
+    "*_WEBHOOK_URL",
     "AWS_*",
     "AZURE_*",
     "GOOGLE_APPLICATION_CREDENTIALS",
