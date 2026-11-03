@@ -21,3 +21,4 @@ port = 8787
 # rw = ["~/.npm"]           # also writable (default: the project, ~/.claude, ~/.claude.json)
 # hide = ["~/secrets"]      # also hidden (default: ~/.ssh, ~/.gnupg, keyveil's files, ...)
 # network = "isolated"      # "isolated" (default; needs slirp4netns), "none" or "host"
+# userns = false            # true: allow nested user namespaces (Chromium/Playwright, podman)

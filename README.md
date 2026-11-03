@@ -674,6 +674,7 @@ everything else keeps working:
 | `/run`, `/tmp`, `~/.cache` | private and empty: no Docker/LXD/libvirt/ssh-agent/keyring sockets |
 | `~/.ssh`, `~/.gnupg`, cloud CLI credentials (`aws`, `gcloud`, `az`, `kubectl`, `gh`, `doctl`, `op`, `rclone`, …), package-registry tokens (`~/.npmrc`, `~/.pypirc`, `~/.cargo/credentials`, Maven, Gradle), git and container-registry logins (`~/.git-credentials`, `~/.config/git/credentials`, `~/.config/containers/auth.json`), editor extensions' key stores (Copilot, Cline, Continue), `~/.vault-token`, `~/.terraform.d`, `~/.fly`, `~/.config/configstore`, browser and Thunderbird profiles, shell, editor and REPL history, keyveil's config, your encrypted key file and identity | hidden. The list can't cover every tool: `--hide PATH` adds more |
 | `sudo`, `su`, setuid programs | can't gain privileges (`no_new_privs`) |
+| Nested user namespaces (`unshare -U`, Chromium's sandbox, rootless podman) | blocked with bubblewrap 0.8+ (`--disable-userns`): they are the usual first step of a namespace-escape exploit. `--allow-userns` (or `[sandbox] userns = true`) turns them back on for agents that drive a browser |
 | Other processes (including keyveil) | invisible (own PID namespace) |
 | Environment variables that look like secrets | removed; the names are printed |
 | Network | its own: the internet works (through `slirp4netns`), and keyveil is at the usual `127.0.0.1:<port>`; nothing else on your `127.0.0.1`, and no abstract Unix sockets (your X11 display, D-Bus, input methods), so `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY` and `DBUS_SESSION_BUS_ADDRESS` are cleared and `~/.Xauthority` is hidden. Services on your other addresses (e.g. your LAN IP) are still reachable |
@@ -681,6 +682,7 @@ everything else keeps working:
 Options: `--network isolated|none|host` (or `[sandbox] network = ...`; see below),
 `--project DIR`, `--rw PATH` / `--hide PATH` (or `[sandbox] rw = [...]`, `hide = [...]`
 in `config.toml`), `--keep-env NAME` (keep one variable the sandbox would otherwise remove), `--ssh-agent`,
+`--allow-userns` (or `[sandbox] userns = true`; see the table above),
 and `--dry-run` to print the exact `bwrap` command without running it. `--hide` also works on
 a single file inside a writable folder, e.g. `--hide ~/.claude/.credentials.json`. It refuses
 to make anything writable (the project or a `--rw` path) that is your home directory, contains
@@ -696,7 +698,8 @@ It doesn't cover:
 - **Using the proxy**: a confined agent can still make API calls with your keys. That is the
   point, but see path allowlists above to limit what it can call.
 - **Sending your project's files somewhere**: the agent has network access.
-- **Kernel exploits** that escape Linux namespaces.
+- **Kernel exploits** that escape Linux namespaces (blocking nested user namespaces removes
+  the most common entry point, but not all of them).
 
 **Claude Code settings check after exit.** keyveil records the security settings in
 `~/.claude.json`, the project's `.claude/settings.json`, `.claude/settings.local.json` and

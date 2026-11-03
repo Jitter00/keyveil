@@ -389,6 +389,36 @@ class BuildTests(SandboxCase):
         )
         self.assertEqual(inner[6:], command)
 
+    def test_namespaces(self):
+        with mock.patch.object(sandbox, "bwrap_version", return_value=(0, 9, 0)):
+            argv, _, warnings = self.build()
+            for flag in ("--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup"):
+                self.assertIn(flag, argv)
+            self.assertIn("--disable-userns", argv)
+            self.assertFalse(any("user namespaces" in w for w in warnings), warnings)
+            argv, _, warnings = self.build(userns=True)
+            self.assertNotIn("--disable-userns", argv)
+            self.assertTrue(any("--allow-userns" in w for w in warnings), warnings)
+            cfg = dataclasses.replace(self.cfg, sandbox_userns=True)
+            argv, _, _ = self.build(cfg=cfg)
+            self.assertNotIn("--disable-userns", argv)
+        with mock.patch.object(sandbox, "bwrap_version", return_value=(0, 6, 1)):
+            argv, _, warnings = self.build()
+            self.assertNotIn("--disable-userns", argv)
+            self.assertTrue(any("needs 0.8+" in w for w in warnings), warnings)
+
+    def test_bwrap_version_is_parsed_and_cached(self):
+        sandbox._BWRAP_VERSION = None
+        self.addCleanup(setattr, sandbox, "_BWRAP_VERSION", None)
+        done = mock.Mock(stdout="bubblewrap 0.11.0\n")
+        with mock.patch.object(sandbox.subprocess, "run", return_value=done) as run:
+            self.assertEqual(sandbox.bwrap_version(), (0, 11, 0))
+            self.assertEqual(sandbox.bwrap_version(), (0, 11, 0))
+            self.assertEqual(run.call_count, 1)
+        sandbox._BWRAP_VERSION = None
+        with mock.patch.object(sandbox.subprocess, "run", side_effect=OSError):
+            self.assertEqual(sandbox.bwrap_version(), (0, 0, 0))
+
     def test_network_modes(self):
         bridge = self.root / "bridge"
         for mode in ("isolated", "none"):
@@ -515,6 +545,16 @@ class LiveTests(SandboxCase):
         self.last = result
         self.assertEqual(result.returncode, 0, result.stderr)
         return dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+
+    def test_nested_user_namespaces_are_blocked_unless_allowed(self):
+        if sandbox.bwrap_version() < sandbox.DISABLE_USERNS_SINCE:
+            self.skipTest("bwrap %s has no --disable-userns" % (sandbox.bwrap_version(),))
+        if not shutil.which("unshare"):
+            self.skipTest("unshare (util-linux) is required")
+        probe = 'echo "userns=$(unshare -U true 2>/dev/null && echo yes || echo no)"'
+        self.assertEqual(self.run_inside(probe), {"userns": "no"})
+        self.assertEqual(self.run_inside(probe, "--allow-userns"), {"userns": "yes"})
+        self.assertIn("nested user namespaces allowed", self.last.stderr)
 
     def test_confinement(self):
         out = self.run_inside(r"""

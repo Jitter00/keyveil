@@ -10,6 +10,8 @@ keyveil proxy on 127.0.0.1. What it can no longer do:
     dirs can't be changed or swapped, and they are checked again after the agent exits;
   * read common secret stores (~/.ssh, ~/.gnupg, cloud CLI credentials, browser profiles...);
   * see or signal other processes (own PID namespace), including the keyveil proxy;
+  * create user namespaces (bwrap 0.8+, unless --allow-userns), the usual first step of a
+    namespace-escape exploit;
   * reach anything on the host's loopback or abstract Unix sockets (X11, D-Bus, ibus...):
     the agent gets its own network namespace. slirp4netns gives it the internet, and a
     relay gives it the keyveil proxy at the usual 127.0.0.1:<port>, and nothing else.
@@ -20,6 +22,7 @@ import fcntl
 import fnmatch
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -192,6 +195,32 @@ DANGEROUS_GIT_KEYS = (
 
 class SandboxError(Exception):
     """A problem that prevents starting the sandbox; the message is shown to the user."""
+
+
+_BWRAP_VERSION = None
+
+
+def bwrap_version():
+    """bubblewrap's version as a tuple, (0, 0, 0) if it can't be found. Cached."""
+    global _BWRAP_VERSION
+    if _BWRAP_VERSION is None:
+        _BWRAP_VERSION = (0, 0, 0)
+        try:
+            out = subprocess.run(  # noqa: S603 - fixed argv
+                ["bwrap", "--version"],  # noqa: S607 - bwrap from PATH
+                capture_output=True,
+                text=True,
+                timeout=10,
+            ).stdout
+            found = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
+            if found:
+                _BWRAP_VERSION = tuple(int(n) for n in found.groups())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return _BWRAP_VERSION
+
+
+DISABLE_USERNS_SINCE = (0, 8, 0)  # bwrap --disable-userns
 
 
 def _secret_env_names(environ, route_env_names, keep):
@@ -561,9 +590,11 @@ def build(
     network="isolated",
     port=cfgmod.DEFAULT_PORT,
     bridge_dir=None,
+    userns=None,
 ):
     """Return (bwrap argv, removed env var names, warnings). Inspects (and reads git config)
-    but changes nothing.
+    but changes nothing. ``userns`` (default: ``cfg.sandbox_userns``) allows the agent to
+    create user namespaces inside the sandbox.
 
     Unless ``network`` is "host", the argv expects ``run()`` to have prepared
     ``bridge_dir`` (the proxy relay socket, bridge.py and resolv.conf).
@@ -579,11 +610,31 @@ def build(
     if not project.is_dir():
         raise SandboxError("project directory not found: %s" % project)
     warnings = []
+    if userns is None:
+        userns = cfg.sandbox_userns
     argv = [
         "bwrap",
         "--die-with-parent",
         "--unshare-pid",
         "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup",
+    ]
+    # Nested user namespaces are the usual first step of a namespace-escape exploit, and
+    # the agent doesn't need them, unless it drives a Chromium browser or rootless podman.
+    if userns:
+        warnings.append(
+            "nested user namespaces allowed (--allow-userns): needed by Chromium/Playwright "
+            "and rootless podman, but it widens the kernel attack surface"
+        )
+    elif bwrap_version() >= DISABLE_USERNS_SINCE:
+        argv.append("--disable-userns")
+    else:
+        warnings.append(
+            "bubblewrap %s can't block nested user namespaces (needs 0.8+)"
+            % ".".join(map(str, bwrap_version()))
+        )
+    argv += [
         "--ro-bind",
         "/",
         "/",

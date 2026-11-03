@@ -121,7 +121,10 @@ command = "echo hi"
         self.assertEqual(cfg.sandbox_rw, (self.tmp / "a",))
         self.assertEqual(cfg.sandbox_hide, (self.tmp / "b", Path("/c")))
         self.assertEqual(config.load().sandbox_rw, ())
+        self.assertFalse(config.load().sandbox_userns)
+        self.assertTrue(config.load(self.write("[sandbox]\nuserns = true\n")).sandbox_userns)
         for bad in (
+            '[sandbox]\nuserns = "yes"\n',
             '[sandbox]\nrw = "~/a"\n',
             "[sandbox]\nhide = [1]\n",
             '[sandbox]\nhide = [""]\n',

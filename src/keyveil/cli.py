@@ -259,6 +259,7 @@ def cmd_sandbox(args):
             network=network,
             port=cfg.port,
             bridge_dir=bridge_dir,
+            userns=True if args.allow_userns else None,
         )
 
     try:
@@ -469,6 +470,12 @@ def build_parser():
         choices=cfgmod.SANDBOX_NETWORKS,
         help="isolated (default): own network with internet via slirp4netns; none: only the "
         "keyveil proxy; host: share your network (not isolated, see README)",
+    )
+    p.add_argument(
+        "--allow-userns",
+        action="store_true",
+        help="let the agent create user namespaces (Chromium/Playwright, rootless podman); "
+        "they are blocked by default (or set [sandbox] userns = true)",
     )
     p.add_argument("--dry-run", action="store_true", help="print the bwrap command and exit")
     p.add_argument(

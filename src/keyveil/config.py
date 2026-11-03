@@ -32,6 +32,7 @@ port = 8787
 # rw = ["~/.npm"]           # also writable (default: the project, ~/.claude, ~/.claude.json)
 # hide = ["~/secrets"]      # also hidden (default: ~/.ssh, ~/.gnupg, keyveil's files, ...)
 # network = "isolated"      # "isolated" (default; needs slirp4netns), "none" or "host"
+# userns = false            # true: allow nested user namespaces (Chromium/Playwright, podman)
 """
 
 
@@ -72,13 +73,14 @@ class Config:
     sandbox_rw: tuple = ()  # extra writable paths for `keyveil sandbox`
     sandbox_hide: tuple = ()  # extra hidden paths for `keyveil sandbox`
     sandbox_network: str = "isolated"  # `keyveil sandbox` network mode
+    sandbox_userns: bool = False  # `keyveil sandbox`: allow nested user namespaces
     source: Path | None = None  # the file this was loaded from, if any
 
 
 _TOP = {"port", "routes_file", "idle_timeout", "age", "decrypt", "sandbox"}
 _AGE = {"identity", "file", "binary"}
 _DECRYPT = {"command"}
-_SANDBOX = {"rw", "hide", "network"}
+_SANDBOX = {"rw", "hide", "network", "userns"}
 SANDBOX_NETWORKS = ("isolated", "none", "host")
 
 
@@ -109,6 +111,13 @@ def _table(data, key, where):
     value = data.get(key, {})
     if not isinstance(value, dict):
         raise ConfigError("%s: [%s] must be a table" % (where, key))
+    return value
+
+
+def _bool(table, key, where, default=False):
+    value = table.get(key, default)
+    if not isinstance(value, bool):
+        raise ConfigError("%s: %r must be true or false" % (where, key))
     return value
 
 
@@ -224,5 +233,6 @@ def load(path=None, *, port=None, decrypt_command=None):
         sandbox_rw=_path_list(box, "rw", where + " [sandbox]"),
         sandbox_hide=_path_list(box, "hide", where + " [sandbox]"),
         sandbox_network=_network(box, where + " [sandbox]"),
+        sandbox_userns=_bool(box, "userns", where + " [sandbox]"),
         source=source,
     )
