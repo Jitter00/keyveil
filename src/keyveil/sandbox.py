@@ -628,7 +628,7 @@ def build(
             "and rootless podman, but it widens the kernel attack surface"
         )
     elif bwrap_version() >= DISABLE_USERNS_SINCE:
-        argv.append("--disable-userns")
+        argv += ["--unshare-user", "--disable-userns"]  # bwrap refuses the second alone
     else:
         warnings.append(
             "bubblewrap %s can't block nested user namespaces (needs 0.8+)"

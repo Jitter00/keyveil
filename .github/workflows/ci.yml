@@ -62,7 +62,10 @@ jobs:
           sudo apt-get install -y -q bubblewrap slirp4netns
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - name: Unit tests
+        # The hosted runner's memlock hard limit is below the 64 MiB that the proxy's
+        # memlock test needs; raise it so the test runs instead of skipping.
         run: |
+          sudo prlimit --pid "$$" --memlock=67108864:67108864
           uv run --locked python -m unittest discover -s tests -v 2>&1 | tee test-output.txt
           if grep -q "skipped" test-output.txt; then
             echo "::error::some tests were skipped (bubblewrap not usable on the runner?)"

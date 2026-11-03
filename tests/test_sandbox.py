@@ -395,6 +395,7 @@ class BuildTests(SandboxCase):
             for flag in ("--unshare-pid", "--unshare-ipc", "--unshare-uts", "--unshare-cgroup"):
                 self.assertIn(flag, argv)
             self.assertIn("--disable-userns", argv)
+            self.assertIn("--unshare-user", argv)  # bwrap refuses --disable-userns without it
             self.assertFalse(any("user namespaces" in w for w in warnings), warnings)
             argv, _, warnings = self.build(userns=True)
             self.assertNotIn("--disable-userns", argv)
