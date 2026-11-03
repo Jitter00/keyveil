@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.4.0 (2026-11-03)
+
+### Features
+
+- **sandbox**: Block nested user namespaces and add Codex and Gemini profiles
+  ([#7](https://github.com/Jitter00/keyveil/pull/7),
+  [`2370a0b`](https://github.com/Jitter00/keyveil/commit/2370a0b963cf9dd6d7f01373816eb8102c9080a8))
+
+
 ## v0.3.1 (2026-11-02)
 
 ### Bug Fixes
