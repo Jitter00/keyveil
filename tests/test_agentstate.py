@@ -45,6 +45,21 @@ class PathTests(AgentStateCase):
         self.assertIn(claude / "commands", missing)
         self.assertIn(claude / "backups", agentstate.private_paths(self.home))
 
+    def test_per_project_folders(self):
+        claude = self.home / ".claude"
+        (self.home / ".codex").mkdir()  # no per-project layout
+        projects = [Path("/home/u/my_proj.v2")]
+        here = claude / "projects" / "-home-u-my-proj-v2"
+        self.assertEqual(
+            agentstate.per_project_paths(self.home, projects),
+            [(claude / "projects", [here])],
+        )
+        self.assertIn(here, agentstate.prepare(self.home, projects=projects))
+        self.assertEqual(here.stat().st_mode & 0o777, 0o700)
+        (here / "t.jsonl").write_text("kept\n")
+        self.assertNotIn(here, agentstate.prepare(self.home, projects=projects))
+        self.assertEqual((here / "t.jsonl").read_text(), "kept\n")
+
     def test_missing_prompt_history_is_created_appendable(self):
         claude, codex = self.home / ".claude", self.home / ".codex"
         codex.mkdir()

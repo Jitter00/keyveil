@@ -5,6 +5,7 @@ because the sandbox replaces /tmp and that would make "hidden" checks pass trivi
 import dataclasses
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -16,7 +17,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from keyveil import config, proxy, sandbox
+from keyveil import agentstate, config, proxy, sandbox
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -123,7 +124,12 @@ class BuildTests(SandboxCase):
         hides = [
             i
             for i, a in enumerate(argv)
-            if (a == "--tmpfs" and argv[i + 1] not in ("/run", "/tmp", str(self.home / ".cache")))
+            if (
+                a == "--tmpfs"
+                and argv[i + 1] not in ("/run", "/tmp", str(self.home / ".cache"))
+                # scoping an agent's state: it keeps the current project's folder on purpose
+                and self.home / ".claude" not in Path(argv[i + 1]).parents
+            )
             or (a == "--ro-bind" and argv[i + 1] == "/dev/null")
         ]
         self.assertTrue(binds and hides)
@@ -193,7 +199,9 @@ class BuildTests(SandboxCase):
         self.assertEqual(argv[i - 1 : i + 3], ["--tmpfs", made, "--remount-ro", made])
         self.assertNotIn(str(p / ".git/worktrees/wt/hooks"), argv)
         self.assertFalse(any("node_modules" in a for a in argv))
-        last_pin = max(i for i, a in enumerate(argv) if a == "--bind")
+        kept = self.home / ".claude/projects"  # the current project's folder, restored later
+        binds = [i for i, a in enumerate(argv) if a == "--bind"]
+        last_pin = max(i for i in binds if kept not in Path(argv[i + 1]).parents)
         self.assertLess(last_pin, argv.index(str(p / ".git/hooks")))  # pins first
 
     @unittest.skipUnless(shutil.which("git"), "git is required")
@@ -642,6 +650,7 @@ class LiveTests(SandboxCase):
         (fake / "slirp4netns").chmod(0o755)
         marker = self.project / "started"
         bridge_dir = self.root / "bridge"
+        agentstate.prepare(self.home, projects=sandbox.project_roots(self.project))
         argv, _, _ = self.build(
             ["sh", "-c", "touch %s" % shlex.quote(str(marker))],
             network="isolated",
@@ -753,6 +762,65 @@ PY
         self.assertEqual(json.loads(cfg.read_text())["mcpServers"], {"evil": {"command": "sh"}})
         log = (self.home / ".local/state/keyveil/keyveil.log").read_text()
         self.assertIn("mcpServers", log)
+
+    def test_other_projects_are_out_of_reach(self):
+        claude = self.home / ".claude"
+        here = claude / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(self.project.resolve()))
+        for rel, text in {
+            "projects/-other-project/t.jsonl": "other transcript\n",
+            "projects/-other-project/memory/m.md": "other memory\n",
+            "plans/other.md": "other plan\n",
+            "paste-cache/other.txt": "other paste\n",
+            "file-history/s/f": "other file\n",
+            "sessions/s.json": "other session\n",
+        }.items():
+            (claude / rel).parent.mkdir(parents=True, exist_ok=True)
+            (claude / rel).write_text(text)
+        (here / "memory").mkdir(parents=True)
+        (here / "memory/m.md").write_text("this memory\n")
+        out = self.run_inside(rf"""
+            c=~/.claude
+            echo "projects=$(ls -A $c/projects)"
+            echo "plans=$(ls -A $c/plans)"
+            echo "paste=$(ls -A $c/paste-cache)"
+            echo "history=$(ls -A $c/file-history)"
+            echo "sessions=$(ls -A $c/sessions)"
+            echo "memory=$(cat $c/projects/{here.name}/memory/m.md)"
+            echo new > $c/projects/{here.name}/t.jsonl
+            mkdir $c/projects/-other-project && echo planted > $c/projects/-other-project/t.jsonl
+            echo "mvdir=$( (mv $c/projects $c/p.old) 2>/dev/null && echo yes || echo no)"
+        """)
+        self.assertEqual(
+            out,
+            {
+                "projects": here.name,
+                "plans": "",
+                "paste": "",
+                "history": "",
+                "sessions": "",
+                "memory": "this memory",
+                "mvdir": "no",
+            },
+        )
+        self.assertEqual((here / "t.jsonl").read_text(), "new\n")  # this project's persist
+        self.assertEqual(
+            (claude / "projects/-other-project/t.jsonl").read_text(), "other transcript\n"
+        )
+        self.assertEqual((claude / "plans/other.md").read_text(), "other plan\n")
+
+    def test_very_long_project_path_still_starts(self):
+        long = self.home / ("x" * 240)
+        long.mkdir()
+        made = agentstate.prepare(self.home, projects=sandbox.project_roots(long))
+        self.assertFalse([p for p in made if len(p.name) > agentstate.MAX_FOLDER_NAME])
+        argv, _, warnings = self.build(project=long)
+        self.assertIn("too long", " ".join(warnings))
+        self.assertIn(str(self.home / ".claude/projects"), argv)
+
+    def test_session_in_a_subfolder_keeps_the_repository_memory(self):
+        sub = self.project / "sub"
+        sub.mkdir()
+        self.assertEqual(sandbox.project_roots(sub), [sub.resolve(), self.project.resolve()])
 
     def test_prompt_history_reads_empty_and_discards_writes(self):
         history = self.home / ".claude" / "history.jsonl"

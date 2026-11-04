@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,12 +21,13 @@ from pathlib import Path
 # One coding agent's files in the home directory. ``state`` is bind-mounted read-write;
 # inside the state directory ``read_only_files`` (created with that content if missing) and
 # ``read_only_dirs`` (created empty if missing) are read-only, ``private`` directories are
-# empty tmpfs copies, ``prompt_history`` files read as empty and discard writes (they hold
-# what you typed in every project), ``login`` names the credential files (readable by
-# default, like the rest of the state: the agent can't work without them; hide them with
-# --hide when the agent goes through keyveil), ``watched`` are home-relative JSON files whose
-# security settings are compared after exit, and ``home_env`` can move the state directory
-# (e.g. CODEX_HOME).
+# empty tmpfs copies, ``per_project`` is a directory with one folder per project path of
+# which the agent only sees the current project's, ``prompt_history`` files read as empty and
+# discard writes (they hold what you typed in every project), ``login`` names the credential
+# files (readable by default, like the rest of the state: the agent can't work without them;
+# hide them with --hide when the agent goes through keyveil), ``watched`` are home-relative
+# JSON files whose security settings are compared after exit, and ``home_env`` can move the
+# state directory (e.g. CODEX_HOME).
 @dataclass(frozen=True)
 class AgentProfile:
     name: str
@@ -33,6 +35,7 @@ class AgentProfile:
     read_only_files: dict = field(default_factory=dict)
     read_only_dirs: tuple = ()
     private: tuple = ()
+    per_project: str | None = None
     prompt_history: tuple = ()
     login: tuple = ()
     watched: tuple = ()
@@ -57,7 +60,23 @@ PROFILES = (
         ),
         # Other Claude Code sessions source shell snapshots and session environments, and
         # restore ~/.claude.json from backups; the agent's own copies go away when it exits.
-        private=("backups", "shell-snapshots", "session-env", "downloads"),
+        # The rest aren't organised by project and hold content from all of them, and
+        # sessions/ is how local sessions find and message each other.
+        private=(
+            "backups",
+            "shell-snapshots",
+            "session-env",
+            "downloads",
+            "debug",
+            "file-history",
+            "paste-cache",
+            "plans",
+            "sessions",
+            "tasks",
+            "todos",
+            "usage-data",
+        ),
+        per_project="projects",
         prompt_history=("history.jsonl",),
         login=(".credentials.json",),
         watched=(".claude.json",),
@@ -191,12 +210,33 @@ def private_paths(home, environ=None):
     return [d / rel for profile, d in agents(home, environ) for rel in profile.private]
 
 
+# Claude Code shortens longer names with a hash we can't reproduce.
+MAX_FOLDER_NAME = 200
+
+
+def per_project_paths(home, projects, environ=None):
+    """[(directory to empty, [the folders of ``projects`` to keep in it])]."""
+    names = [_folder_name(p) for p in projects]
+    return [
+        (
+            d / profile.per_project,
+            [d / profile.per_project / n for n in names if len(n) <= MAX_FOLDER_NAME],
+        )
+        for profile, d in agents(home, environ)
+        if profile.per_project
+    ]
+
+
+def _folder_name(project):
+    return re.sub(r"[^a-zA-Z0-9]", "-", str(project))
+
+
 def prompt_history_paths(home, environ=None):
     return [d / rel for profile, d in agents(home, environ) for rel in profile.prompt_history]
 
 
-def prepare(home, environ=None):
-    """Create the missing files that get mounted over, with safe modes. Returns them.
+def prepare(home, environ=None, projects=()):
+    """Create the missing files and folders that get mounted, with safe modes. Returns them.
 
     Otherwise the agent could create a read-only file itself, and bwrap would create a missing
     prompt history as 0444, which an unsandboxed session could then not append to.
@@ -210,6 +250,11 @@ def prepare(home, environ=None):
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(text)
+                made.append(path)
+    for _, folders in per_project_paths(home, projects, environ):
+        for path in folders:
+            if not os.path.lexists(path):
+                path.mkdir(mode=0o700, parents=True)
                 made.append(path)
     return made
 

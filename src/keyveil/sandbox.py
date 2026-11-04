@@ -323,6 +323,18 @@ def _commondir(gitdir):
     return (gitdir / text).resolve() if text else gitdir
 
 
+def project_roots(project):
+    """``project`` and the repository it is part of, which Claude Code keeps memory under."""
+    project = Path(project).resolve()
+    for d in (project, *project.parents):
+        entry = d / ".git"
+        if os.path.lexists(entry):
+            gitdir = _gitdir_of(entry)
+            main = _commondir(gitdir).parent if gitdir else d  # a worktree's main repository
+            return list(dict.fromkeys((project, d, main)))
+    return [project]
+
+
 def _git_layout(roots):
     """(`.git` entries below ``roots``, every git dir they use).
 
@@ -737,6 +749,17 @@ def build(
         argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
     for path in agentstate.private_paths(home, environ):
         argv += ["--tmpfs", str(path)]
+    # Other projects' transcripts and memory are out of reach; this one's stay, for --resume.
+    roots = project_roots(project)
+    for directory, folders in agentstate.per_project_paths(home, roots, environ):
+        if len(folders) < len(roots):
+            warnings.append(
+                "this project's path is too long to find its transcripts and memory in %s: "
+                "this session starts without them and won't save them" % directory
+            )
+        argv += ["--tmpfs", str(directory)]
+        for path in folders:
+            argv += ["--bind", str(path), str(path)]
     # --dev-bind, because the other binds are nodev: the agent would get "Permission denied"
     # each time it saves a prompt, instead of an empty file that discards what it writes.
     for path in agentstate.prompt_history_paths(home, environ):
