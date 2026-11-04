@@ -2,6 +2,20 @@
 
 <!-- version list -->
 
+## v0.4.1 (2026-11-04)
+
+### Bug Fixes
+
+- **sandbox**: Keep other projects' agent data out of reach
+  ([#9](https://github.com/Jitter00/keyveil/pull/9),
+  [`e0c4fc4`](https://github.com/Jitter00/keyveil/commit/e0c4fc4dd13d6611935d362c51a0ab9c9461d418))
+
+### Continuous Integration
+
+- Add Claude Code GitHub workflows ([#8](https://github.com/Jitter00/keyveil/pull/8),
+  [`920826d`](https://github.com/Jitter00/keyveil/commit/920826dbb99405bb65d8fc6b93b1ceb587a0d252))
+
+
 ## v0.4.0 (2026-11-03)
 
 ### Features
