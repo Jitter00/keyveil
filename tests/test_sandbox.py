@@ -754,6 +754,30 @@ PY
         log = (self.home / ".local/state/keyveil/keyveil.log").read_text()
         self.assertIn("mcpServers", log)
 
+    def test_prompt_history_reads_empty_and_discards_writes(self):
+        history = self.home / ".claude" / "history.jsonl"
+        history.write_text("a prompt from another project\n")
+        out = self.run_inside(r"""
+            h=~/.claude/history.jsonl
+            echo "read=$(cat "$h" 2>&1)"
+            echo "append=$( (echo injected >> "$h") 2>/dev/null && echo yes || echo no)"
+            echo "after=$(cat "$h" 2>&1)"
+            echo "mv=$( (mv "$h" "$h.old") 2>/dev/null && echo yes || echo no)"
+            echo "rm=$( (rm -f "$h") 2>/dev/null && echo yes || echo no)"
+        """)
+        self.assertEqual(out, {"read": "", "append": "yes", "after": "", "mv": "no", "rm": "no"})
+        self.assertEqual(history.read_text(), "a prompt from another project\n")
+
+    def test_missing_prompt_history_stays_usable_outside(self):
+        history = self.home / ".claude" / "history.jsonl"
+        history.unlink(missing_ok=True)
+        out = self.run_inside(r"""
+            echo "append=$( (echo typed >> ~/.claude/history.jsonl) 2>/dev/null && echo yes)"
+        """)
+        self.assertEqual(out, {"append": "yes"})
+        self.assertEqual(history.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(history.read_text(), "")
+
     def test_hide_works_for_a_file_inside_a_writable_directory(self):
         # e.g. `--hide ~/.claude/.credentials.json` while ~/.claude itself is writable.
         creds = self.home / ".claude" / ".credentials.json"
@@ -761,7 +785,7 @@ PY
         out = self.run_inside(
             r"""
             echo "creds=$(cat ~/.claude/.credentials.json 2>/dev/null)"
-            s=~/.claude/history.jsonl
+            s=~/.claude/stats.json
             echo "sibling=$( (echo x > "$s") 2>/dev/null && echo writable || echo no)"
         """,
             "--hide",

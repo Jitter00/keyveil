@@ -737,6 +737,10 @@ def build(
         argv += ["--tmpfs", str(path), "--remount-ro", str(path)]
     for path in agentstate.private_paths(home, environ):
         argv += ["--tmpfs", str(path)]
+    # --dev-bind, because the other binds are nodev: the agent would get "Permission denied"
+    # each time it saves a prompt, instead of an empty file that discards what it writes.
+    for path in agentstate.prompt_history_paths(home, environ):
+        argv += ["--dev-bind", "/dev/null", str(path)]
     for path in hides:
         if path.is_dir() and not path.is_symlink():
             argv.extend(["--tmpfs", str(path)])

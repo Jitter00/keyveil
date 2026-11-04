@@ -20,10 +20,12 @@ from pathlib import Path
 # One coding agent's files in the home directory. ``state`` is bind-mounted read-write;
 # inside the state directory ``read_only_files`` (created with that content if missing) and
 # ``read_only_dirs`` (created empty if missing) are read-only, ``private`` directories are
-# empty tmpfs copies, ``login`` names the credential files (readable by default, like the
-# rest of the state: the agent can't work without them; hide them with --hide when the agent
-# goes through keyveil), ``watched`` are home-relative JSON files whose security settings
-# are compared after exit, and ``home_env`` can move the state directory (e.g. CODEX_HOME).
+# empty tmpfs copies, ``prompt_history`` files read as empty and discard writes (they hold
+# what you typed in every project), ``login`` names the credential files (readable by
+# default, like the rest of the state: the agent can't work without them; hide them with
+# --hide when the agent goes through keyveil), ``watched`` are home-relative JSON files whose
+# security settings are compared after exit, and ``home_env`` can move the state directory
+# (e.g. CODEX_HOME).
 @dataclass(frozen=True)
 class AgentProfile:
     name: str
@@ -31,6 +33,7 @@ class AgentProfile:
     read_only_files: dict = field(default_factory=dict)
     read_only_dirs: tuple = ()
     private: tuple = ()
+    prompt_history: tuple = ()
     login: tuple = ()
     watched: tuple = ()
     home_env: str | None = None
@@ -55,6 +58,7 @@ PROFILES = (
         # Other Claude Code sessions source shell snapshots and session environments, and
         # restore ~/.claude.json from backups; the agent's own copies go away when it exits.
         private=("backups", "shell-snapshots", "session-env", "downloads"),
+        prompt_history=("history.jsonl",),
         login=(".credentials.json",),
         watched=(".claude.json",),
     ),
@@ -65,6 +69,7 @@ PROFILES = (
         # hooks.json and *.config.toml profiles likewise. AGENTS.md: instructions.
         read_only_files={"config.toml": "", "hooks.json": "{}\n", "AGENTS.md": ""},
         read_only_dirs=("memories", "skills", "prompts", "plugins", "agents", "rules", "hooks"),
+        prompt_history=("history.jsonl",),
         login=("auth.json",),
         home_env="CODEX_HOME",
     ),
@@ -186,11 +191,20 @@ def private_paths(home, environ=None):
     return [d / rel for profile, d in agents(home, environ) for rel in profile.private]
 
 
+def prompt_history_paths(home, environ=None):
+    return [d / rel for profile, d in agents(home, environ) for rel in profile.prompt_history]
+
+
 def prepare(home, environ=None):
-    """Create the missing read-only files (so the agent can't create them). Returns them."""
+    """Create the missing files that get mounted over, with safe modes. Returns them.
+
+    Otherwise the agent could create a read-only file itself, and bwrap would create a missing
+    prompt history as 0444, which an unsandboxed session could then not append to.
+    """
     made = []
     for profile, d in agents(home, environ):
-        for rel, text in profile.read_only_files.items():
+        history = dict.fromkeys(profile.prompt_history, "")
+        for rel, text in {**profile.read_only_files, **history}.items():
             path = d / rel
             if not os.path.lexists(path):
                 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)

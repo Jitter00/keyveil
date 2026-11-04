@@ -45,10 +45,26 @@ class PathTests(AgentStateCase):
         self.assertIn(claude / "commands", missing)
         self.assertIn(claude / "backups", agentstate.private_paths(self.home))
 
+    def test_missing_prompt_history_is_created_appendable(self):
+        claude, codex = self.home / ".claude", self.home / ".codex"
+        codex.mkdir()
+        (self.home / ".gemini").mkdir()
+        self.assertEqual(
+            agentstate.prompt_history_paths(self.home),
+            [claude / "history.jsonl", codex / "history.jsonl"],
+        )
+        made = agentstate.prepare(self.home)
+        self.assertIn(claude / "history.jsonl", made)
+        self.assertEqual((claude / "history.jsonl").stat().st_mode & 0o777, 0o600)
+        (claude / "history.jsonl").write_text("typed earlier\n")
+        agentstate.prepare(self.home)
+        self.assertEqual((claude / "history.jsonl").read_text(), "typed earlier\n")
+
     def test_no_claude_directory_no_paths(self):
         shutil.rmtree(self.home / ".claude")
         self.assertEqual(agentstate.read_only_paths(self.home), ([], []))
         self.assertEqual(agentstate.private_paths(self.home), [])
+        self.assertEqual(agentstate.prompt_history_paths(self.home), [])
         self.assertEqual(agentstate.prepare(self.home), [])
         self.assertEqual(agentstate.state_paths(self.home), [])
 
