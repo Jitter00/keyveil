@@ -268,7 +268,8 @@ def cmd_sandbox(args):
             print(sandbox.describe(argv, network))
             return 0
         sandbox.preflight(network)
-        if agentstate.prepare(Path.home()):  # created now, so mounted read-only: build again
+        # created now, so mounted read-only: build again
+        if agentstate.prepare(Path.home(), projects=sandbox.project_roots(project)):
             argv, removed, warnings = build()
     except sandbox.SandboxError as e:
         raise CLIError(str(e)) from e
